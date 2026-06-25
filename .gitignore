@@ -1,0 +1,29 @@
+.DS_Store
+
+# Local secrets and machine-specific config
+.env
+.env.*
+*.local
+*.secret
+*.key
+id_*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Generated macOS app artifacts
+build/
+dist/
+*.app/
+
+# Python / shell tooling cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor metadata
+.vscode/
+.idea/
