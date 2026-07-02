@@ -217,6 +217,129 @@ ssh_alias_configured() {
   ' "$CONFIG_FILE"
 }
 
+list_codex2autodl_aliases_for_target() {
+  local target_user="$1"
+  local target_host="$2"
+  local target_port="$3"
+  local exclude_alias="${4:-}"
+
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk \
+    -v target_user="$target_user" \
+    -v target_host="$target_host" \
+    -v target_port="$target_port" \
+    -v exclude_alias="$exclude_alias" '
+    function reset_block() {
+      managed = 0
+      alias = ""
+      host = ""
+      user = ""
+      port = ""
+    }
+    function flush_block() {
+      if (
+        managed == 1 &&
+        alias != "" &&
+        alias != exclude_alias &&
+        host == target_host &&
+        user == target_user &&
+        port == target_port
+      ) {
+        print alias
+      }
+      reset_block()
+    }
+    BEGIN {
+      reset_block()
+    }
+    /^# Added by codex2autodl setup script$/ {
+      flush_block()
+      managed = 1
+      next
+    }
+    $1 == "Host" {
+      if (managed == 1 && alias == "") {
+        alias = $2
+      } else {
+        flush_block()
+      }
+      next
+    }
+    managed == 1 && tolower($1) == "hostname" {
+      host = $2
+      next
+    }
+    managed == 1 && tolower($1) == "user" {
+      user = $2
+      next
+    }
+    managed == 1 && tolower($1) == "port" {
+      port = $2
+      next
+    }
+    END {
+      flush_block()
+    }
+  ' "$CONFIG_FILE"
+}
+
+remove_ssh_aliases_from_config() {
+  local alias
+  local tmp_config
+
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  [[ "$#" -gt 0 ]] || return 0
+
+  for alias in "$@"; do
+    [[ -n "$alias" ]] || continue
+    tmp_config="$(mktemp)"
+    awk \
+      -v alias="$alias" \
+      -v reliability_begin="# >>> codex2autodl ssh reliability: $alias >>>" \
+      -v reliability_end="# <<< codex2autodl ssh reliability: $alias <<<" '
+      function flush_pending_marker() {
+        if (pending_marker != "") {
+          print pending_marker
+          pending_marker = ""
+        }
+      }
+      $0 == reliability_begin { reliability_skip = 1; next }
+      $0 == reliability_end { reliability_skip = 0; next }
+      reliability_skip == 1 { next }
+      /^# Added by codex2autodl setup script$/ {
+        pending_marker = $0
+        next
+      }
+      $1 == "Host" {
+        skip = 0
+        for (i = 2; i <= NF; i++) {
+          if ($i == alias) {
+            skip = 1
+          }
+        }
+        if (skip == 1) {
+          pending_marker = ""
+          next
+        }
+        flush_pending_marker()
+        print
+        next
+      }
+      skip != 1 {
+        flush_pending_marker()
+        print
+      }
+      END {
+        flush_pending_marker()
+      }
+    ' "$CONFIG_FILE" > "$tmp_config"
+    cat "$tmp_config" > "$CONFIG_FILE"
+    rm -f "$tmp_config"
+  done
+
+  chmod 600 "$CONFIG_FILE"
+}
+
 ensure_ssh_reliability_override() {
   local alias="$1"
   local marker_begin="# >>> codex2autodl ssh reliability: $alias >>>"
@@ -702,7 +825,6 @@ done
     echo "SSH reverse proxy tunnel is healthy: remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
   else
     echo "Warning: tunnel watchdog started, but the tunnel is not healthy yet. Check: tail -f $log_path" >&2
-    return 1
   fi
 }
 
@@ -731,6 +853,51 @@ stop_reverse_proxy_tunnel() {
     echo "No managed SSH reverse proxy tunnel found for remote port $remote_port."
   fi
   rm -f "$control_path"
+}
+
+remove_alias_tunnel_artifacts() {
+  local alias
+  local artifact
+
+  for alias in "$@"; do
+    [[ -n "$alias" ]] || continue
+    for artifact in "$HOME/.ssh"/codex2autodl-"$alias"-proxy-*; do
+      [[ -e "$artifact" ]] || continue
+      rm -f "$artifact"
+    done
+  done
+}
+
+replace_existing_aliases_for_target() {
+  local target_user="$1"
+  local target_host="$2"
+  local target_port="$3"
+  local new_alias="$4"
+  local old_alias
+  local old_alias_list
+  local old_aliases=()
+
+  old_alias_list="$(list_codex2autodl_aliases_for_target "$target_user" "$target_host" "$target_port" "$new_alias")" ||
+    die "failed to scan SSH config for existing aliases"
+
+  while IFS= read -r old_alias; do
+    [[ -n "$old_alias" ]] || continue
+    old_aliases+=("$old_alias")
+  done <<< "$old_alias_list"
+
+  [[ "${#old_aliases[@]}" -gt 0 ]] || return 0
+
+  echo "Found existing codex2autodl alias(es) for this SSH target; replacing them with: $new_alias"
+  for old_alias in "${old_aliases[@]}"; do
+    echo "  removing old alias: $old_alias"
+    stop_reverse_proxy_tunnel "$old_alias" "$REMOTE_API_PORT"
+    if [[ "$REMOTE_PROXY_PORT" != "$REMOTE_API_PORT" ]]; then
+      stop_reverse_proxy_tunnel "$old_alias" "$REMOTE_PROXY_PORT"
+    fi
+  done
+
+  remove_ssh_aliases_from_config "${old_aliases[@]}"
+  remove_alias_tunnel_artifacts "${old_aliases[@]}"
 }
 
 configure_remote_proxy() {
@@ -1178,7 +1345,7 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
   fi
 fi
 
-[[ "$ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] || die "alias can only contain letters, numbers, dot, underscore, and dash"
+[[ "$ALIAS" =~ ^[A-Za-z0-9._-]+$ && "$ALIAS" != -* ]] || die "alias can only contain letters, numbers, dot, underscore, and dash, and cannot start with dash"
 if [[ "$SSH_PASSWORD_PROMPT" -eq 1 && -n "$SSH_PASSWORD_FILE" ]]; then
   die "--ssh-password-prompt and --ssh-password-file cannot be used together"
 fi
@@ -1446,6 +1613,8 @@ if [[ "$KEY_LOGIN_READY" -ne 1 || "$SSH_PASSWORD_PROMPT" -eq 1 ]]; then
   PASSWORD_UPLOAD_DONE=1
 fi
 
+replace_existing_aliases_for_target "$USER" "$HOST" "$PORT" "$ALIAS"
+
 echo "Writing SSH config: $CONFIG_FILE"
 touch "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
@@ -1455,9 +1624,19 @@ awk \
   -v alias="$ALIAS" \
   -v reliability_begin="# >>> codex2autodl ssh reliability: $ALIAS >>>" \
   -v reliability_end="# <<< codex2autodl ssh reliability: $ALIAS <<<" '
+  function flush_pending_marker() {
+    if (pending_marker != "") {
+      print pending_marker
+      pending_marker = ""
+    }
+  }
   $0 == reliability_begin { reliability_skip = 1; next }
   $0 == reliability_end { reliability_skip = 0; next }
   reliability_skip == 1 { next }
+  /^# Added by codex2autodl setup script$/ {
+    pending_marker = $0
+    next
+  }
   $1 == "Host" {
     skip = 0
     for (i = 2; i <= NF; i++) {
@@ -1465,9 +1644,20 @@ awk \
         skip = 1
       }
     }
+    if (skip == 1) {
+      pending_marker = ""
+      next
+    }
+    flush_pending_marker()
+    print
+    next
   }
   skip != 1 {
+    flush_pending_marker()
     print
+  }
+  END {
+    flush_pending_marker()
   }
 ' "$CONFIG_FILE" > "$TMP_CONFIG"
 
