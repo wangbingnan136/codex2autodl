@@ -237,14 +237,7 @@ list_codex2autodl_aliases_for_target() {
       port = ""
     }
     function flush_block() {
-      if (
-        managed == 1 &&
-        alias != "" &&
-        alias != exclude_alias &&
-        host == target_host &&
-        user == target_user &&
-        port == target_port
-      ) {
+      if (managed == 1 && alias != "" && alias != exclude_alias && host == target_host && user == target_user && port == target_port) {
         print alias
       }
       reset_block()
