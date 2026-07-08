@@ -24,6 +24,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Rust build output
+target/
+
 # Editor metadata
 .vscode/
 .idea/

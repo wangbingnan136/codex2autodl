@@ -28,6 +28,8 @@ Usage:
   scripts/setup-autodl-codex.sh [--alias NAME] --stop-proxy-tunnel
   scripts/setup-autodl-codex.sh [--alias NAME] --stop-api-tunnel
   scripts/setup-autodl-codex.sh [--alias NAME] --stop-api-tunnel --local-api-port PORT
+  scripts/setup-autodl-codex.sh [--alias NAME] --quick-reconnect --local-api-port PORT
+  scripts/setup-autodl-codex.sh --quick-reconnect-active --local-api-port PORT
 
 Examples:
   scripts/setup-autodl-codex.sh --interactive --local-api-port 8080 --api-key-prompt
@@ -39,6 +41,8 @@ Examples:
   scripts/setup-autodl-codex.sh --local-proxy-port 7890 --diagnose
   scripts/setup-autodl-codex.sh --local-api-port 8080 --api-key-prompt --diagnose
   scripts/setup-autodl-codex.sh --api-key-prompt --diagnose
+  scripts/setup-autodl-codex.sh --alias autodl-v3 --quick-reconnect --local-api-port 8080
+  scripts/setup-autodl-codex.sh --quick-reconnect-active --local-api-port 8080
 
 What it does:
   1. Generates ~/.ssh/autodl_codex if missing.
@@ -454,7 +458,8 @@ run_local_diagnostics() {
   else
     echo "api tunnel watchdog: not found"
   fi
-  if ssh -S "$api_control_path" -O check "$alias" >/dev/null 2>&1; then
+  if ssh -S "$api_control_path" -O check "$alias" >/dev/null 2>&1 &&
+    remote_loopback_port_open "$alias" "$REMOTE_API_PORT" "$api_control_path"; then
     echo "api tunnel: healthy remote 127.0.0.1:$REMOTE_API_PORT"
   else
     echo "api tunnel: not healthy remote 127.0.0.1:$REMOTE_API_PORT"
@@ -471,7 +476,8 @@ run_local_diagnostics() {
     else
       echo "proxy tunnel watchdog: not found"
     fi
-    if ssh -S "$proxy_control_path" -O check "$alias" >/dev/null 2>&1; then
+    if ssh -S "$proxy_control_path" -O check "$alias" >/dev/null 2>&1 &&
+      remote_loopback_port_open "$alias" "$REMOTE_PROXY_PORT" "$proxy_control_path"; then
       echo "proxy tunnel: healthy remote 127.0.0.1:$REMOTE_PROXY_PORT"
     else
       echo "proxy tunnel: not healthy remote 127.0.0.1:$REMOTE_PROXY_PORT"
@@ -713,6 +719,93 @@ pid_is_running() {
   [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1
 }
 
+cleanup_stale_ssh_control_socket() {
+  local alias="$1"
+  local control_path=""
+
+  control_path="$(ssh -G "$alias" 2>/dev/null | awk '$1 == "controlpath" { print $2; exit }')" || return 0
+  [[ -n "$control_path" && "$control_path" == *codex2autodl-* && -S "$control_path" ]] || return 0
+
+  if ! ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+    rm -f "$control_path"
+  fi
+}
+
+active_codex_remote_aliases() {
+  ps -axo command= 2>/dev/null |
+    awk '
+      /codex app-server proxy/ && /ssh[[:space:]].*-T/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i != "ssh") {
+            continue
+          }
+          skip = 0
+          for (j = i + 1; j <= NF; j++) {
+            token = $j
+            if (skip == 1) {
+              skip = 0
+              continue
+            }
+            if (token == "-o" || token == "-i" || token == "-F" || token == "-S" ||
+                token == "-p" || token == "-l" || token == "-J") {
+              skip = 1
+              continue
+            }
+            if (token ~ /^-/) {
+              continue
+            }
+            print token
+            break
+          }
+          break
+        }
+      }
+    ' |
+    awk '!seen[$0]++'
+}
+
+remote_port_probe_script() {
+  cat <<'REMOTE_PORT_PROBE'
+set -u
+port="${CODEX2AUTODL_PROBE_PORT:-}"
+case "$port" in
+  ''|*[!0-9]*) exit 64 ;;
+esac
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3); s.close()' "$port"
+elif command -v python >/dev/null 2>&1; then
+  python -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3); s.close()' "$port"
+elif command -v nc >/dev/null 2>&1; then
+  nc -z -w 3 127.0.0.1 "$port"
+elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+  timeout 5 bash -lc ":</dev/tcp/127.0.0.1/$port"
+elif command -v curl >/dev/null 2>&1; then
+  curl -sS --connect-timeout 3 --max-time 5 -o /dev/null "http://127.0.0.1:$port/"
+elif command -v wget >/dev/null 2>&1; then
+  wget -S -O /dev/null -T 5 "http://127.0.0.1:$port/" 2>&1 | grep -q 'HTTP/'
+else
+  exit 127
+fi
+REMOTE_PORT_PROBE
+}
+
+rotate_tunnel_log_if_needed() {
+  local log_path="$1"
+  local max_bytes="${CODEX2AUTODL_TUNNEL_LOG_MAX_BYTES:-1048576}"
+  local size
+
+  [[ -f "$log_path" ]] || return 0
+  size="$(wc -c < "$log_path" 2>/dev/null || printf '0')"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 0
+  (( size > max_bytes )) || return 0
+
+  rm -f "$log_path.3"
+  [[ -f "$log_path.2" ]] && mv -f "$log_path.2" "$log_path.3"
+  [[ -f "$log_path.1" ]] && mv -f "$log_path.1" "$log_path.2"
+  mv -f "$log_path" "$log_path.1"
+}
+
 wait_for_reverse_proxy_tunnel() {
   local alias="$1"
   local remote_port="$2"
@@ -720,13 +813,65 @@ wait_for_reverse_proxy_tunnel() {
   local attempt
 
   for ((attempt = 1; attempt <= 20; attempt++)); do
-    if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+    if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1 &&
+      remote_loopback_port_open "$alias" "$remote_port" "$control_path"; then
       return 0
     fi
     sleep 1
   done
 
   return 1
+}
+
+remote_loopback_port_open() {
+  local alias="$1"
+  local remote_port="$2"
+  local control_path="${3:-}"
+  local ssh_args=(
+    -o BatchMode=yes
+    -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT"
+    -o "ServerAliveInterval=$SSH_ALIVE_INTERVAL"
+    -o "ServerAliveCountMax=2"
+  )
+
+  if [[ -n "$control_path" && -S "$control_path" ]]; then
+    ssh_args=(-S "$control_path" "${ssh_args[@]}")
+  fi
+
+  remote_port_probe_script |
+    ssh "${ssh_args[@]}" "$alias" "CODEX2AUTODL_PROBE_PORT=$(shell_quote "$remote_port") sh -s" >/dev/null 2>&1
+}
+
+cleanup_local_reverse_proxy_orphans() {
+  local alias="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local control_path="$4"
+  local reverse_spec="-R 127.0.0.1:${remote_port}:127.0.0.1:${local_port}"
+  local compact_reverse_spec="-R127.0.0.1:${remote_port}:127.0.0.1:${local_port}"
+  local pid
+  local command
+  local killed=0
+
+  while IFS= read -r line; do
+    pid="${line%% *}"
+    command="${line#* }"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$command" == *"ssh -fN"* ]] || continue
+    [[ "$command" == *" $alias"* ]] || continue
+    if [[ "$command" == *"$control_path"* ||
+      "$command" == *"$reverse_spec"* ||
+      "$command" == *"$compact_reverse_spec"* ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+      killed=$((killed + 1))
+    fi
+  done < <(ps -axo pid=,command= 2>/dev/null || true)
+
+  if [[ "$killed" -gt 0 ]]; then
+    sleep 1
+  fi
+
+  return 0
 }
 
 start_reverse_proxy_tunnel() {
@@ -742,6 +887,9 @@ start_reverse_proxy_tunnel() {
   pid_path="$(proxy_tunnel_watchdog_pid_path "$alias" "$remote_port")"
   log_path="$(proxy_tunnel_log_path "$alias" "$remote_port")"
   mkdir -p "$HOME/.ssh"
+
+  cleanup_stale_ssh_control_socket "$alias"
+  rotate_tunnel_log_if_needed "$log_path"
 
   if [[ -f "$pid_path" ]]; then
     existing_pid="$(cat "$pid_path" 2>/dev/null || true)"
@@ -762,6 +910,7 @@ start_reverse_proxy_tunnel() {
   if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
     echo "SSH reverse proxy tunnel is already running; adding watchdog supervision:"
   else
+    cleanup_local_reverse_proxy_orphans "$alias" "$local_port" "$remote_port" "$control_path"
     rm -f "$control_path"
     echo "Starting supervised SSH reverse proxy tunnel:"
   fi
@@ -778,19 +927,54 @@ start_reverse_proxy_tunnel() {
     CODEX_AUTODL_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT" \
     CODEX_AUTODL_CHECK_INTERVAL="$TUNNEL_CHECK_INTERVAL" \
     CODEX_AUTODL_RETRY_INTERVAL="$TUNNEL_RETRY_INTERVAL" \
+    CODEX_AUTODL_RETRY_MAX_INTERVAL="$TUNNEL_RETRY_MAX_INTERVAL" \
     nohup bash -c '
-set -u
+set +u
+retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
 
 log() {
   printf "%s %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$*"
 }
 
+trap "rc=\$?; log watchdog-exiting-rc=\$rc-line=\$LINENO" EXIT HUP INT TERM
+
+cleanup_local_orphans() {
+  local reverse_spec="-R 127.0.0.1:${CODEX_AUTODL_REMOTE_PORT}:127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}"
+  local compact_reverse_spec="-R127.0.0.1:${CODEX_AUTODL_REMOTE_PORT}:127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}"
+  local line pid command killed=0
+
+  while IFS= read -r line; do
+    pid="${line%% *}"
+    command="${line#* }"
+    [ -n "$pid" ] || continue
+    case "$command" in
+      *"ssh -fN"*"$CODEX_AUTODL_ALIAS"*)
+        case "$command" in
+          *"$CODEX_AUTODL_CONTROL_PATH"*|*"$reverse_spec"*|*"$compact_reverse_spec"*)
+            kill "$pid" >/dev/null 2>&1 || true
+            killed=$((killed + 1))
+            ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+$(ps -axo pid=,command= 2>/dev/null || true)
+EOF
+
+  if [ "$killed" -gt 0 ]; then
+    log "removed $killed local orphan reverse tunnel process(es)"
+    sleep 1
+  fi
+}
+
 while :; do
   if ssh -S "$CODEX_AUTODL_CONTROL_PATH" -O check "$CODEX_AUTODL_ALIAS" >/dev/null 2>&1; then
+    retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
     sleep "$CODEX_AUTODL_CHECK_INTERVAL"
     continue
   fi
 
+  cleanup_local_orphans
   rm -f "$CODEX_AUTODL_CONTROL_PATH"
   log "reverse tunnel down; starting remote 127.0.0.1:${CODEX_AUTODL_REMOTE_PORT} -> local 127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}"
   if ssh -fN -M -S "$CODEX_AUTODL_CONTROL_PATH" \
@@ -803,12 +987,18 @@ while :; do
     -R "127.0.0.1:${CODEX_AUTODL_REMOTE_PORT}:127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}" \
     "$CODEX_AUTODL_ALIAS"; then
     log "reverse tunnel started"
-    sleep "$CODEX_AUTODL_CHECK_INTERVAL"
+    retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
   else
     rc=$?
     log "reverse tunnel start failed rc=$rc"
-    sleep "$CODEX_AUTODL_RETRY_INTERVAL"
+    log "retrying in ${retry_interval}s"
+    sleep "$retry_interval"
+    retry_interval=$((retry_interval * 2))
+    if [ "$retry_interval" -gt "$CODEX_AUTODL_RETRY_MAX_INTERVAL" ]; then
+      retry_interval="$CODEX_AUTODL_RETRY_MAX_INTERVAL"
+    fi
   fi
+
 done
 ' >>"$log_path" 2>&1 &
 
@@ -1178,6 +1368,8 @@ REMOTE_PROXY_PORT=""
 PROXY_SCHEME="http"
 STOP_PROXY_TUNNEL=0
 STOP_API_TUNNEL=0
+QUICK_RECONNECT=0
+QUICK_RECONNECT_ACTIVE=0
 LOCAL_API_SPEC=""
 LOCAL_API_PORT=""
 REMOTE_API_PORT=""
@@ -1197,6 +1389,7 @@ SSH_CONNECT_TIMEOUT=15
 SSH_CONTROL_PERSIST=10m
 TUNNEL_CHECK_INTERVAL=15
 TUNNEL_RETRY_INTERVAL=10
+TUNNEL_RETRY_MAX_INTERVAL=120
 SSH_DIR="$HOME/.ssh"
 KEY_FILE="$SSH_DIR/autodl_codex"
 CONFIG_FILE="$SSH_DIR/config"
@@ -1283,6 +1476,14 @@ while [[ $# -gt 0 ]]; do
       STOP_API_TUNNEL=1
       shift
       ;;
+    --quick-reconnect)
+      QUICK_RECONNECT=1
+      shift
+      ;;
+    --quick-reconnect-active)
+      QUICK_RECONNECT_ACTIVE=1
+      shift
+      ;;
     --api-key-prompt)
       API_KEY_PROMPT=1
       shift
@@ -1339,6 +1540,15 @@ if [[ "$INTERACTIVE" -eq 1 ]]; then
 fi
 
 [[ "$ALIAS" =~ ^[A-Za-z0-9._-]+$ && "$ALIAS" != -* ]] || die "alias can only contain letters, numbers, dot, underscore, and dash, and cannot start with dash"
+if [[ "$QUICK_RECONNECT" -eq 1 && ${#ARGS[@]} -gt 0 ]]; then
+  die "--quick-reconnect works with an existing SSH alias; do not pass a new SSH command"
+fi
+if [[ "$QUICK_RECONNECT_ACTIVE" -eq 1 && ${#ARGS[@]} -gt 0 ]]; then
+  die "--quick-reconnect-active repairs existing active SSH aliases; do not pass a new SSH command"
+fi
+if [[ "$QUICK_RECONNECT" -eq 1 && "$QUICK_RECONNECT_ACTIVE" -eq 1 ]]; then
+  die "use only one of --quick-reconnect or --quick-reconnect-active"
+fi
 if [[ "$SSH_PASSWORD_PROMPT" -eq 1 && -n "$SSH_PASSWORD_FILE" ]]; then
   die "--ssh-password-prompt and --ssh-password-file cannot be used together"
 fi
@@ -1415,8 +1625,10 @@ if [[ -n "$LOCAL_API_SPEC" ]]; then
 
   [[ "$LOCAL_API_PORT" =~ ^[0-9]+$ ]] || die "local API port must be numeric: $LOCAL_API_PORT"
   [[ "$REMOTE_API_PORT" =~ ^[0-9]+$ ]] || die "remote API port must be numeric: $REMOTE_API_PORT"
-  API_PROVIDER_BASE_URL="$API_SCHEME://127.0.0.1:$REMOTE_API_PORT/v1"
-  if [[ -z "$REMOTE_PROXY_URL" ]]; then
+  if [[ "$STOP_API_TUNNEL" -eq 0 ]]; then
+    API_PROVIDER_BASE_URL="$API_SCHEME://127.0.0.1:$REMOTE_API_PORT/v1"
+  fi
+  if [[ -z "$REMOTE_PROXY_URL" && "$STOP_API_TUNNEL" -eq 0 ]]; then
     CLEAR_REMOTE_PROXY=1
   fi
 fi
@@ -1426,7 +1638,54 @@ if [[ -z "$REMOTE_API_PORT" ]]; then
 fi
 
 if [[ ${#ARGS[@]} -eq 0 ]]; then
+  if [[ "$QUICK_RECONNECT_ACTIVE" -eq 1 ]]; then
+    require_cmd ssh
+    if [[ -z "$LOCAL_API_PORT" ]]; then
+      LOCAL_API_PORT="$REMOTE_API_PORT"
+    fi
+    active_aliases=()
+    while IFS= read -r active_alias; do
+      [[ -n "$active_alias" ]] || continue
+      [[ "$active_alias" =~ ^[A-Za-z0-9._-]+$ && "$active_alias" != -* ]] || continue
+      ssh_alias_configured "$active_alias" || continue
+      active_aliases+=("$active_alias")
+    done < <(active_codex_remote_aliases)
+
+    if [[ "${#active_aliases[@]}" -eq 0 ]]; then
+      echo "No active Codex remote SSH aliases found."
+      exit 0
+    fi
+
+    echo "Quick reconnect active API tunnel(s): ${active_aliases[*]}"
+    for active_alias in "${active_aliases[@]}"; do
+      echo
+      echo "== repairing active alias: $active_alias"
+      ensure_ssh_reliability_override "$active_alias"
+      start_reverse_proxy_tunnel "$active_alias" "$LOCAL_API_PORT" "$REMOTE_API_PORT"
+    done
+
+    if [[ "$RUN_DIAGNOSE" -eq 1 ]]; then
+      for active_alias in "${active_aliases[@]}"; do
+        run_local_diagnostics "$active_alias"
+      done
+    fi
+    exit 0
+  fi
+
   ensure_ssh_reliability_override "$ALIAS"
+
+  if [[ "$QUICK_RECONNECT" -eq 1 ]]; then
+    require_cmd ssh
+    if [[ -z "$LOCAL_API_PORT" ]]; then
+      LOCAL_API_PORT="$REMOTE_API_PORT"
+    fi
+    echo "Quick reconnect: repairing API tunnel only."
+    start_reverse_proxy_tunnel "$ALIAS" "$LOCAL_API_PORT" "$REMOTE_API_PORT"
+    if [[ "$RUN_DIAGNOSE" -eq 1 ]]; then
+      run_local_diagnostics "$ALIAS"
+    fi
+    exit 0
+  fi
 
   if [[ "$STOP_PROXY_TUNNEL" -eq 1 ]]; then
     require_cmd ssh

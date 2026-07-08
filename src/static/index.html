@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>codex2autodl</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">C2A</span>
+          <span class="brand-name">codex2autodl</span>
+        </div>
+        <nav class="nav-list" aria-label="主导航">
+          <button class="nav-item active" type="button" data-view="servers">服务器</button>
+          <button class="nav-item" type="button" data-view="tunnels">隧道</button>
+          <button class="nav-item" type="button" data-view="diagnostics">诊断</button>
+          <button class="nav-item" type="button" data-view="settings">设置</button>
+        </nav>
+        <div class="sidebar-meter">
+          <span>本地面板</span>
+          <strong id="server-count">0</strong>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="view-title">服务器</h1>
+            <p id="data-dir"></p>
+          </div>
+          <div class="toolbar" id="toolbar">
+            <label class="search-box">
+              <span>搜索</span>
+              <input id="search" type="search" autocomplete="off" />
+            </label>
+            <button class="secondary-button" id="repair-active" type="button">修复当前活跃连接</button>
+            <button class="primary-button" id="add-profile" type="button">新增服务器</button>
+          </div>
+        </header>
+
+        <section class="table-panel" id="server-view" aria-label="服务器列表">
+          <table>
+            <thead>
+              <tr>
+                <th class="check-col"><input type="checkbox" aria-label="选择全部" /></th>
+                <th class="index-col">序号</th>
+                <th>连接名</th>
+                <th>SSH 地址</th>
+                <th>API 端口</th>
+                <th>状态</th>
+                <th>健康</th>
+                <th>隧道</th>
+                <th>最近连接</th>
+                <th class="actions-col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="profile-rows"></tbody>
+          </table>
+          <div class="empty-state" id="empty-state">
+            <strong>还没有服务器</strong>
+            <button class="text-button" type="button" id="empty-add">新增服务器</button>
+          </div>
+        </section>
+
+        <section class="view-panel" id="view-panel" aria-live="polite" hidden></section>
+      </main>
+
+      <aside class="detail-panel" id="detail-panel" aria-label="服务器详情">
+        <div class="detail-header">
+          <h2 id="detail-title">新增服务器</h2>
+          <button class="icon-button" type="button" id="close-panel" aria-label="关闭">×</button>
+        </div>
+        <form id="profile-form">
+          <label>
+            <span>连接名</span>
+            <input name="alias" required autocomplete="off" placeholder="autodl-a100-01" />
+          </label>
+          <label>
+            <span>SSH 命令</span>
+            <input
+              name="ssh_command"
+              required
+              autocomplete="off"
+              placeholder="ssh -p 51418 root@connect.westd.seetacloud.com"
+            />
+          </label>
+          <label>
+            <span>SSH 密码</span>
+            <input name="ssh_password" type="password" autocomplete="new-password" />
+          </label>
+          <div class="field-grid">
+            <label>
+              <span>本地 API 端口</span>
+              <input name="local_api_port" type="number" min="1" max="65535" value="8080" />
+            </label>
+            <label>
+              <span>远端 API 端口</span>
+              <input name="remote_api_port" type="number" min="1" max="65535" value="8080" />
+            </label>
+          </div>
+          <label>
+            <span>API Key</span>
+            <input name="api_key" type="password" autocomplete="new-password" />
+          </label>
+          <label>
+            <span>备注</span>
+            <textarea name="note" rows="3" placeholder="A100 / 训练机 / 临时实例"></textarea>
+          </label>
+          <div class="form-actions">
+            <button class="secondary-button" type="button" id="save-profile">保存</button>
+            <button class="primary-button" type="submit">保存并连接</button>
+          </div>
+        </form>
+      </aside>
+
+      <section class="log-drawer" id="log-drawer" aria-label="任务日志">
+        <div class="log-header">
+          <div>
+            <span id="job-state">等待任务</span>
+            <strong id="job-title">日志</strong>
+          </div>
+          <button class="icon-button" type="button" id="close-log" aria-label="关闭日志">×</button>
+        </div>
+        <pre id="job-log"></pre>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/assets/app.js" type="module"></script>
+  </body>
+</html>

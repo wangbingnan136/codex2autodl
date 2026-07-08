@@ -118,25 +118,75 @@ codex2api API base URL   http://127.0.0.1:8080/v1 reachable
 
 ## 图形应用
 
-不想每次敲命令，可以在 macOS 上构建一个双击应用：
+### Rust 控制面板（推荐）
+
+不想每次敲命令，可以直接启动 Rust 本地控制面板：
+
+```bash
+cargo run -- serve
+```
+
+默认会打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+这个面板做三件事：
+
+| 面板动作 | 背后做什么 | 类比 |
+| --- | --- | --- |
+| 保存服务器 | 把 alias、SSH 地址、端口写入 `~/.codex2autodl/profiles.json` | 通讯录保存联系人 |
+| 保存密码/API key | 写入 macOS Keychain，不进项目文件 | 钥匙放保险柜 |
+| 点击连接 | 调用同一套 setup/diagnose 流程，自动拉起 SSH key、provider 和隧道 | 按一下总闸，水管自动接好 |
+
+已经由旧脚本写入 `~/.ssh/config` 的连接会在第一次打开面板时自动导入。旧连接的地址会保留；如果想真正一键连接，需要在面板里编辑该服务器并补存 SSH 密码。
+
+删除面板里的服务器时，会同步删除本机 `~/.ssh/config`、`~/.ssh/codex2autodl/config` 中对应的 codex2autodl SSH Host 记录，并清掉 Codex 全局状态里同名的远程连接索引。也就是说，Codex App 设置页里的“来自此 Mac 的 SSH 连接”不会再留下同名旧历史。
+
+如果想一次性清空所有 codex2autodl 写入过的 AutoDL SSH 历史：
+
+```bash
+cargo run -- clear-autodl-history
+```
+
+清理前会自动备份被改动的 SSH/Codex 配置，例如：
+
+```text
+~/.ssh/config.codex2autodl-backup-1783072616
+~/.codex/.codex-global-state.json.codex2autodl-backup-1783081365
+```
+
+也可以构建成双击应用：
 
 ```bash
 ./scripts/build-macos-app.sh
-open dist/codex-ssh-remote.app
+open dist/codex2autodl-control.app
 ```
 
-应用会弹窗收集：
+双击应用会启动同一个本地控制面板，并自动打开浏览器。默认端口是 `8765`；如果端口被占用，可以这样改：
 
-- `Connection alias`，例如 `autodl-alz-v3`。
-- AutoDL SSH 命令，例如 `ssh -p 51418 root@connect.westd.seetacloud.com`。
-- AutoDL SSH 密码。
-- 本机 `codex2api` 端口，默认 `8080`。
-- `codex2api` API key；留空表示复用远端已有 Codex 登录。
-- 是否运行诊断，默认 `Setup + Diagnose`。
+```bash
+CODEX2AUTODL_PORT=8777 open dist/codex2autodl-control.app
+```
 
-图形应用本质上只是帮你打开 Terminal 并运行同一个脚本。密码和 API key 会先写入 `0600` 临时文件，脚本结束后删除；Terminal 命令行里不会直接暴露密钥。
+### 旧脚本仍然可用
 
-第一次运行时，macOS 可能会询问是否允许 `codex-ssh-remote` 控制 Terminal。需要允许，因为它要打开 Terminal 展示日志。
+Rust 控制面板现在是新的主入口，但底层仍保留原来的脚本能力。你仍然可以继续用命令行：
+
+```bash
+./scripts/setup-autodl-codex.sh \
+  --alias autodl-alz-v3 \
+  --ssh-password-prompt \
+  --local-api-port 8080 \
+  --api-key-prompt \
+  --diagnose \
+  "ssh -p 51418 root@connect.westd.seetacloud.com"
+```
+
+控制面板里对应的字段就是这条命令的图形化版本：连接名、SSH 命令、SSH 密码、本机 `codex2api` 端口、API key 和诊断开关。
+
+Rust 面板在执行连接任务时，也会把 Keychain 里的密码/API key 临时写入 `0600` 文件，脚本结束后删除；命令行参数里不会直接暴露明文密钥。
 
 ## 常用命令
 
@@ -365,6 +415,7 @@ ssh autodl-alz-v3
 ## 安全说明
 
 - AutoDL 密码只用于首次写 SSH 公钥，脚本不保存。
+- Rust 控制面板会把已保存的 SSH 密码和 API key 放进 macOS Keychain，本地 `profiles.json` 只保存地址、端口、备注这类非密钥信息。
 - `codex2api` key 会写入远端 Codex 登录缓存 `~/.codex/auth.json`，它等同于密码，不要提交、不要贴到聊天里。
 - 本机私钥在 `~/.ssh/autodl_codex`，不要共享。
 - 图形应用的临时密钥文件权限是 `0600`，脚本结束后删除。
@@ -388,6 +439,9 @@ ssh autodl-alz-v3
 # 查看诊断
 ./scripts/setup-autodl-codex.sh --alias autodl-alz-v3 --diagnose
 
+# 清空 codex2autodl 写入的 AutoDL SSH/Codex 远程历史
+cargo run -- clear-autodl-history
+
 # 停止 8080 API 隧道和 watchdog
 ./scripts/setup-autodl-codex.sh --alias autodl-alz-v3 --stop-api-tunnel
 
@@ -399,13 +453,24 @@ ssh autodl-alz-v3
 
 ```text
 .
+├── Cargo.toml
 ├── assets/
-│   └── codex-ssh-remote-icon-source.png
-├── macos/
-│   └── codex-ssh-remote.applescript
+│   └── codex2autodl-control-icon-source.png
 ├── scripts/
 │   ├── build-macos-app.sh
 │   └── setup-autodl-codex.sh
+├── src/
+│   ├── http.rs
+│   ├── main.rs
+│   ├── paths.rs
+│   ├── profile.rs
+│   ├── runner.rs
+│   ├── secrets.rs
+│   ├── ssh.rs
+│   └── static/
+│       ├── app.css
+│       ├── app.js
+│       └── index.html
 └── README.md
 ```
 
