@@ -235,10 +235,10 @@ pub fn cleanup_alias_artifacts(alias: &str) -> Result<()> {
         }
 
         let path = entry.path();
-        if file_name.ends_with(".watchdog.pid") {
-            if let Ok(pid) = fs::read_to_string(&path) {
-                terminate_pid(pid.trim());
-            }
+        if file_name.ends_with(".watchdog.pid")
+            && let Ok(pid) = fs::read_to_string(&path)
+        {
+            terminate_pid(pid.trim());
         }
         let _ = fs::remove_file(path);
     }
@@ -283,7 +283,7 @@ fn rewrite_codex2autodl_ssh_config_file(
         });
     }
 
-    let text = fs::read_to_string(&config_path)
+    let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read SSH config: {}", config_path.display()))?;
     let lines = text.lines().collect::<Vec<_>>();
     let mut output = Vec::new();
@@ -294,43 +294,41 @@ fn rewrite_codex2autodl_ssh_config_file(
     while i < lines.len() {
         let trimmed = lines[i].trim();
 
-        if let Some(alias) = reliability_alias(trimmed) {
-            if alias_matches(remove_alias, &alias) {
-                removed.insert(alias);
-                changed = true;
+        if let Some(alias) = reliability_alias(trimmed)
+            && alias_matches(remove_alias, &alias)
+        {
+            removed.insert(alias);
+            changed = true;
+            i += 1;
+            while i < lines.len()
+                && !lines[i]
+                    .trim()
+                    .starts_with("# <<< codex2autodl ssh reliability:")
+            {
                 i += 1;
-                while i < lines.len()
-                    && !lines[i]
-                        .trim()
-                        .starts_with("# <<< codex2autodl ssh reliability:")
-                {
-                    i += 1;
-                }
-                if i < lines.len() {
-                    i += 1;
-                }
-                continue;
             }
+            if i < lines.len() {
+                i += 1;
+            }
+            continue;
         }
 
         if trimmed == "# Added by codex2autodl setup script" {
             let host_index = next_non_empty_line(&lines, i + 1);
-            if let Some(host_index) = host_index {
-                if let Some(aliases) = host_aliases(lines[host_index]) {
-                    if aliases
-                        .iter()
-                        .any(|alias| alias_matches(remove_alias, alias))
-                    {
-                        for alias in aliases {
-                            if alias_matches(remove_alias, &alias) {
-                                removed.insert(alias);
-                            }
-                        }
-                        changed = true;
-                        i = end_of_host_block(&lines, host_index + 1);
-                        continue;
+            if let Some(host_index) = host_index
+                && let Some(aliases) = host_aliases(lines[host_index])
+                && aliases
+                    .iter()
+                    .any(|alias| alias_matches(remove_alias, alias))
+            {
+                for alias in aliases {
+                    if alias_matches(remove_alias, &alias) {
+                        removed.insert(alias);
                     }
                 }
+                changed = true;
+                i = end_of_host_block(&lines, host_index + 1);
+                continue;
             }
             if remove_alias.is_none() {
                 changed = true;
@@ -382,7 +380,7 @@ fn rewrite_codex2autodl_ssh_config_file(
     fs::write(&tmp_path, new_text)
         .with_context(|| format!("failed to write temp SSH config: {}", tmp_path.display()))?;
     fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).ok();
-    fs::rename(&tmp_path, &config_path)
+    fs::rename(&tmp_path, config_path)
         .with_context(|| format!("failed to replace SSH config: {}", config_path.display()))?;
 
     Ok(SshHistoryCleanup {
@@ -568,10 +566,8 @@ fn remove_codex_remote_projects(
             .get("hostId")
             .and_then(Value::as_str)
             .is_some_and(|host_id| hosts.contains(host_id));
-        if remove {
-            if let Some(id) = project.get("id").and_then(Value::as_str) {
-                removed_project_ids.insert(id.to_string());
-            }
+        if remove && let Some(id) = project.get("id").and_then(Value::as_str) {
+            removed_project_ids.insert(id.to_string());
         }
         !remove
     });
@@ -829,4 +825,76 @@ pub fn import_managed_ssh_hosts() -> Vec<ImportedSshHost> {
         &mut port,
     );
     imported
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ssh_command_standard() {
+        let target = parse_ssh_command("ssh -p 2222 alice@host.example.com").unwrap();
+        assert_eq!(target.user, "alice");
+        assert_eq!(target.host, "host.example.com");
+        assert_eq!(target.port, 2222);
+    }
+
+    #[test]
+    fn parse_ssh_command_compact_port() {
+        let target = parse_ssh_command("ssh -p2200 root@1.2.3.4").unwrap();
+        assert_eq!(target.port, 2200);
+        assert_eq!(target.host, "1.2.3.4");
+    }
+
+    #[test]
+    fn parse_ssh_command_default_user_and_port() {
+        let target = parse_ssh_command("ssh myhost").unwrap();
+        assert_eq!(target.user, "root");
+        assert_eq!(target.host, "myhost");
+        assert_eq!(target.port, 22);
+    }
+
+    #[test]
+    fn parse_ssh_command_dash_l_user() {
+        let target = parse_ssh_command("ssh -l bob -p 22 host").unwrap();
+        assert_eq!(target.user, "bob");
+        assert_eq!(target.host, "host");
+    }
+
+    #[test]
+    fn parse_ssh_command_skips_option_values() {
+        let target =
+            parse_ssh_command("ssh -i /tmp/key -o StrictHostKeyChecking=no user@host").unwrap();
+        assert_eq!(target.user, "user");
+        assert_eq!(target.host, "host");
+    }
+
+    #[test]
+    fn parse_ssh_command_rejects_non_ssh() {
+        assert!(parse_ssh_command("scp file host:/tmp").is_err());
+    }
+
+    #[test]
+    fn parse_ssh_command_rejects_missing_host() {
+        assert!(parse_ssh_command("ssh -p 22").is_err());
+    }
+
+    #[test]
+    fn parse_ssh_command_rejects_non_numeric_port() {
+        assert!(parse_ssh_command("ssh -p abc host").is_err());
+    }
+
+    #[test]
+    fn validate_alias_accepts_valid() {
+        assert!(validate_alias("connect9").is_ok());
+        assert!(validate_alias("my-box_1.a").is_ok());
+    }
+
+    #[test]
+    fn validate_alias_rejects_invalid() {
+        assert!(validate_alias("").is_err());
+        assert!(validate_alias("-leading-dash").is_err());
+        assert!(validate_alias("has space").is_err());
+        assert!(validate_alias("bad/slash").is_err());
+    }
 }

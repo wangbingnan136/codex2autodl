@@ -49,10 +49,10 @@ fn discover_project_root() -> Result<PathBuf> {
 }
 
 fn data_dir() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("CODEX2AUTODL_HOME") {
-        if !value.trim().is_empty() {
-            return Ok(PathBuf::from(value));
-        }
+    if let Ok(value) = std::env::var("CODEX2AUTODL_HOME")
+        && !value.trim().is_empty()
+    {
+        return Ok(PathBuf::from(value));
     }
 
     Ok(home_dir()?.join(".codex2autodl"))

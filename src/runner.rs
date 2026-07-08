@@ -396,18 +396,18 @@ async fn run_job_inner(
     }
 
     let code = status.code();
-        if status.success() {
-            if matches!(action, JobAction::RepairActive) {
-                ctx.jobs.finish(job_id, JobStatus::Succeeded, code);
-                return Ok(());
-            }
-            let (profile_status, message) = match action {
-                JobAction::Connect => (ProfileStatus::Connected, "连接完成"),
-                JobAction::QuickReconnect => (ProfileStatus::Connected, "隧道已修复"),
-                JobAction::RepairActive => unreachable!("handled above"),
-                JobAction::Diagnose => (ProfileStatus::Connected, "诊断完成"),
-                JobAction::StopTunnel => (ProfileStatus::Stopped, "隧道已停止"),
-            };
+    if status.success() {
+        if matches!(action, JobAction::RepairActive) {
+            ctx.jobs.finish(job_id, JobStatus::Succeeded, code);
+            return Ok(());
+        }
+        let (profile_status, message) = match action {
+            JobAction::Connect => (ProfileStatus::Connected, "连接完成"),
+            JobAction::QuickReconnect => (ProfileStatus::Connected, "隧道已修复"),
+            JobAction::RepairActive => unreachable!("handled above"),
+            JobAction::Diagnose => (ProfileStatus::Connected, "诊断完成"),
+            JobAction::StopTunnel => (ProfileStatus::Stopped, "隧道已停止"),
+        };
         ctx.profiles.mark_status(alias, profile_status, message)?;
         ctx.jobs.finish(job_id, JobStatus::Succeeded, code);
         Ok(())
@@ -555,4 +555,67 @@ fn shell_join_for_log(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dirs() -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "codex2autodl-jobs-test-{}-{}",
+            std::process::id(),
+            crate::profile::now_string().replace([':', '.', '-'], "")
+        ));
+        let logs = base.join("job-logs");
+        let jobs = base.join("jobs");
+        (base, logs, jobs)
+    }
+
+    #[test]
+    fn job_store_persists_and_reloads() {
+        let (base, logs, jobs) = temp_dirs();
+        {
+            let store = JobStore::new(logs.clone(), jobs.clone());
+            let (job, dup) = store.create_or_get_running("boxa", JobAction::Diagnose);
+            assert!(!dup);
+            store.append(&job.id, "line one");
+            store.finish(&job.id, JobStatus::Succeeded, Some(0));
+        }
+        // 新 store 从磁盘恢复该 job。
+        let reloaded = JobStore::new(logs.clone(), jobs.clone());
+        let job = reloaded.get("job-1").expect("job persisted");
+        assert_eq!(job.status, JobStatus::Succeeded);
+        assert!(job.logs.iter().any(|l| l.contains("line one")));
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn job_store_reconciles_ghost_running_jobs() {
+        let (base, logs, jobs) = temp_dirs();
+        {
+            let store = JobStore::new(logs.clone(), jobs.clone());
+            // 创建后不 finish,模拟进程崩溃时残留的 running job。
+            store.create_or_get_running("boxb", JobAction::Connect);
+        }
+        let reloaded = JobStore::new(logs.clone(), jobs.clone());
+        let job = reloaded.get("job-1").expect("job persisted");
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.logs.iter().any(|l| l.contains("面板重启")));
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn dedup_running_job_for_same_alias() {
+        let (base, logs, jobs) = temp_dirs();
+        let store = JobStore::new(logs.clone(), jobs.clone());
+        let (_first, dup1) = store.create_or_get_running("boxc", JobAction::Connect);
+        assert!(!dup1);
+        let (_second, dup2) = store.create_or_get_running("boxc", JobAction::Diagnose);
+        assert!(dup2, "second running request for same alias should dedup");
+
+        fs::remove_dir_all(&base).ok();
+    }
 }

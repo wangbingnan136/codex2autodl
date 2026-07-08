@@ -338,3 +338,128 @@ pub fn now_string() -> String {
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_paths() -> (ProjectPaths, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "codex2autodl-test-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let paths = ProjectPaths {
+            project_root: dir.clone(),
+            data_dir: dir.clone(),
+            profiles_file: dir.join("profiles.json"),
+            setup_script: dir.join("scripts/setup-autodl-codex.sh"),
+        };
+        (paths, dir)
+    }
+
+    #[test]
+    fn health_score_connected_running_is_high() {
+        // 94 基础 + 4(隧道 Running)= 98
+        let score = health_score(&ProfileStatus::Connected, false, &TunnelState::Running);
+        assert_eq!(score, 98);
+    }
+
+    #[test]
+    fn health_score_password_bonus_and_cap() {
+        // 94 + 5(密码) + 4(Running) = 103 -> 截断到 100
+        let score = health_score(&ProfileStatus::Connected, true, &TunnelState::Running);
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn health_score_stale_tunnel_lower_than_running() {
+        let running = health_score(&ProfileStatus::Connected, false, &TunnelState::Running);
+        let stale = health_score(&ProfileStatus::Connected, false, &TunnelState::Stale);
+        let missing = health_score(&ProfileStatus::Connected, false, &TunnelState::Missing);
+        assert!(stale < running);
+        assert_eq!(stale, missing);
+    }
+
+    #[test]
+    fn health_score_never_exceeds_100() {
+        for status in [
+            ProfileStatus::New,
+            ProfileStatus::Running,
+            ProfileStatus::Connected,
+            ProfileStatus::Failed,
+            ProfileStatus::Stopped,
+        ] {
+            for tunnel in [
+                TunnelState::Running,
+                TunnelState::Stale,
+                TunnelState::Missing,
+            ] {
+                for pw in [true, false] {
+                    assert!(health_score(&status, pw, &tunnel) <= 100);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_store_persist_round_trip() {
+        let (paths, dir) = temp_paths();
+        let store = ProfileStore::load(&paths).unwrap();
+        store
+            .save(SaveProfileRequest {
+                alias: "roundtrip".to_string(),
+                ssh_command: "ssh -p 2222 tester@10.0.0.9".to_string(),
+                ssh_password: None,
+                api_key: None,
+                local_api_port: Some(9090),
+                remote_api_port: None,
+                api_provider_name: None,
+                note: Some("hello".to_string()),
+                tags: Some(vec!["t1".to_string()]),
+            })
+            .unwrap();
+
+        // 用新 store 从磁盘重新加载,验证持久化生效。
+        let reloaded = ProfileStore::load(&paths).unwrap();
+        let profile = reloaded.get("roundtrip").expect("profile persisted");
+        assert_eq!(profile.user, "tester");
+        assert_eq!(profile.host, "10.0.0.9");
+        assert_eq!(profile.port, 2222);
+        assert_eq!(profile.local_api_port, 9090);
+        // remote 未指定时回退到 local。
+        assert_eq!(profile.remote_api_port, 9090);
+        assert_eq!(profile.note, "hello");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_status_connected_sets_last_connected() {
+        let (paths, dir) = temp_paths();
+        let store = ProfileStore::load(&paths).unwrap();
+        store
+            .save(SaveProfileRequest {
+                alias: "markme".to_string(),
+                ssh_command: "ssh markhost".to_string(),
+                ssh_password: None,
+                api_key: None,
+                local_api_port: None,
+                remote_api_port: None,
+                api_provider_name: None,
+                note: None,
+                tags: None,
+            })
+            .unwrap();
+        store
+            .mark_status("markme", ProfileStatus::Connected, "ok")
+            .unwrap();
+        let profile = store.get("markme").unwrap();
+        assert_eq!(profile.last_status, ProfileStatus::Connected);
+        assert!(profile.last_connected_at.is_some());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
