@@ -36,10 +36,11 @@ impl AppState {
     pub fn new(paths: ProjectPaths) -> Result<Self> {
         let profiles = ProfileStore::load(&paths)?;
         let job_log_dir = paths.data_dir.join("job-logs");
+        let jobs_dir = paths.data_dir.join("jobs");
         Ok(Self {
             paths,
             profiles,
-            jobs: JobStore::new(job_log_dir),
+            jobs: JobStore::new(job_log_dir, jobs_dir),
         })
     }
 
@@ -52,7 +53,7 @@ impl AppState {
     }
 }
 
-pub async fn serve(state: AppState, addr: SocketAddr) -> Result<()> {
+pub async fn serve(state: AppState, addr: SocketAddr, health_interval: u64) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/assets/app.css", get(css))
@@ -65,11 +66,45 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> Result<()> {
         .route("/api/profiles/{alias}/stop", post(stop_profile))
         .route("/api/active-remotes/repair", post(repair_active_remotes))
         .route("/api/jobs/{id}", get(get_job))
-        .with_state(state);
+        .with_state(state.clone());
+
+    if health_interval > 0 {
+        spawn_health_watchdog(state, health_interval);
+    } else {
+        println!("codex2autodl health watchdog disabled (--health-interval 0)");
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// 后台健康巡检:周期性检查所有 profile 的隧道状态,发现 Stale/Missing
+/// 且当前无同名 running job 时,自动触发一次 RepairActive 修复所有活跃 alias。
+fn spawn_health_watchdog(state: AppState, interval_secs: u64) {
+    println!("codex2autodl health watchdog enabled (interval {interval_secs}s)");
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        // 跳过启动瞬间的第一次立即触发,给隧道一点建立时间。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            // SSH 探测会阻塞,放到 blocking 线程池,避免卡住异步运行时。
+            let profiles = state.profiles.clone();
+            let unhealthy = tokio::task::spawn_blocking(move || profiles.has_unhealthy_tunnel())
+                .await
+                .unwrap_or(false);
+            if unhealthy {
+                // 已有活跃巡检 job 时,create_or_get_running 会去重,不会叠加。
+                start_global_job(
+                    state.clone(),
+                    "active-remotes".to_string(),
+                    JobAction::RepairActive,
+                );
+            }
+        }
+    });
 }
 
 async fn index() -> Response {

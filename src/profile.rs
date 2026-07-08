@@ -163,6 +163,32 @@ impl ProfileStore {
             .cloned()
     }
 
+    /// 是否存在"本应有隧道却掉线"的 profile(供后台健康巡检使用)。
+    /// 只考虑上次状态为 Connected/Running 的 profile,避免对从未连接或已主动停止
+    /// 的 profile 反复触发修复。会执行 SSH 探测,可能阻塞,调用方应放在 blocking 上下文。
+    pub fn has_unhealthy_tunnel(&self) -> bool {
+        let targets = self
+            .profiles
+            .lock()
+            .expect("profiles lock poisoned")
+            .values()
+            .filter(|profile| {
+                matches!(
+                    profile.last_status,
+                    ProfileStatus::Connected | ProfileStatus::Running
+                )
+            })
+            .map(|profile| (profile.alias.clone(), profile.remote_api_port))
+            .collect::<Vec<_>>();
+
+        targets.iter().any(|(alias, remote_port)| {
+            !matches!(
+                ssh::managed_tunnel_state(alias, *remote_port),
+                TunnelState::Running
+            )
+        })
+    }
+
     pub fn save(&self, request: SaveProfileRequest) -> Result<Profile> {
         let alias = request.alias.trim();
         ssh::validate_alias(alias)?;

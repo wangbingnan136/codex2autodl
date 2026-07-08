@@ -15,7 +15,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse()?;
 
     match cli.command {
-        CommandKind::Serve { host, port, open } => {
+        CommandKind::Serve {
+            host,
+            port,
+            open,
+            health_interval,
+        } => {
             let paths = ProjectPaths::discover()?;
             let state = http::AppState::new(paths).context("failed to initialize app state")?;
             let addr: SocketAddr = format!("{host}:{port}")
@@ -28,7 +33,7 @@ async fn main() -> Result<()> {
             }
 
             println!("codex2autodl control panel: {url}");
-            http::serve(state, addr).await
+            http::serve(state, addr, health_interval).await
         }
         CommandKind::ClearAutodlHistory => {
             let cleanup = ssh::clear_codex2autodl_history()?;
@@ -69,7 +74,13 @@ struct Cli {
 
 #[derive(Debug)]
 enum CommandKind {
-    Serve { host: String, port: u16, open: bool },
+    Serve {
+        host: String,
+        port: u16,
+        open: bool,
+        /// 健康巡检间隔(秒);0 表示关闭自动巡检。
+        health_interval: u64,
+    },
     ClearAutodlHistory,
     Help,
 }
@@ -106,6 +117,8 @@ impl Cli {
         let mut host = "127.0.0.1".to_string();
         let mut port = 8765u16;
         let mut open = true;
+        // 默认 60s;可被 CLI --health-interval 覆盖,其次是环境变量,0 表示关闭。
+        let mut health_interval = default_health_interval();
         let mut i = 0;
 
         while i < args.len() {
@@ -122,6 +135,14 @@ impl Cli {
                         .parse()
                         .context("--port must be a number")?;
                 }
+                "--health-interval" => {
+                    i += 1;
+                    health_interval = args
+                        .get(i)
+                        .context("--health-interval requires a value")?
+                        .parse()
+                        .context("--health-interval must be a non-negative integer (seconds)")?;
+                }
                 "--open" => open = true,
                 "--no-open" => open = false,
                 "--help" | "-h" => {
@@ -135,8 +156,21 @@ impl Cli {
         }
 
         Ok(Self {
-            command: CommandKind::Serve { host, port, open },
+            command: CommandKind::Serve {
+                host,
+                port,
+                open,
+                health_interval,
+            },
         })
+    }
+}
+
+/// 读取环境变量 CODEX2AUTODL_HEALTH_INTERVAL(秒),缺省或非法时回退到 60s。
+fn default_health_interval() -> u64 {
+    match std::env::var("CODEX2AUTODL_HEALTH_INTERVAL") {
+        Ok(value) => value.trim().parse::<u64>().unwrap_or(60),
+        Err(_) => 60,
     }
 }
 
@@ -156,11 +190,14 @@ fn print_help() {
         r#"codex2autodl
 
 Usage:
-  codex2autodl serve [--host 127.0.0.1] [--port 8765] [--open|--no-open]
+  codex2autodl serve [--host 127.0.0.1] [--port 8765] [--open|--no-open] [--health-interval 60]
   codex2autodl clear-autodl-history
 
 The Rust control panel keeps server profiles in ~/.codex2autodl and stores
 passwords/API keys in the operating system keychain.
+
+--health-interval <秒> 控制后台自动健康巡检的间隔;0 关闭。也可用环境变量
+CODEX2AUTODL_HEALTH_INTERVAL 设置。巡检会自动修复掉线的 SSH 反向隧道。
 "#
     );
 }

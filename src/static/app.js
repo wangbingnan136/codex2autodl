@@ -4,6 +4,7 @@ const state = {
   view: "servers",
   dataDir: "",
   pollTimer: null,
+  listTimer: null,
 };
 
 const els = {
@@ -78,6 +79,23 @@ function renderActiveView() {
     renderRows();
   } else {
     renderUtilityView();
+  }
+
+  updateListAutoRefresh();
+}
+
+const LIST_REFRESH_MS = 15000;
+
+// 仅在服务器视图、且没有 job 抽屉在轮询时,后台每 15s 静默刷新列表健康状态。
+function updateListAutoRefresh() {
+  const shouldRun = state.view === "servers" && state.pollTimer === null;
+  if (shouldRun && state.listTimer === null) {
+    state.listTimer = setInterval(() => {
+      loadProfiles().catch(() => {});
+    }, LIST_REFRESH_MS);
+  } else if (!shouldRun && state.listTimer !== null) {
+    clearInterval(state.listTimer);
+    state.listTimer = null;
   }
 }
 
@@ -424,8 +442,11 @@ function watchJob(job) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
       await loadProfiles();
+      updateListAutoRefresh();
     }
   }, 1000);
+  // job 轮询期间暂停列表定时刷新,结束后再恢复。
+  updateListAutoRefresh();
 }
 
 function renderJob(job) {
@@ -511,7 +532,14 @@ els.form.addEventListener("submit", (event) => {
   saveProfile({ connect: true }).catch((error) => showToast(error.message));
 });
 els.search.addEventListener("input", renderRows);
-els.closeLog.addEventListener("click", () => els.logDrawer.classList.remove("open"));
+els.closeLog.addEventListener("click", () => {
+  els.logDrawer.classList.remove("open");
+  if (state.pollTimer !== null) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  updateListAutoRefresh();
+});
 els.navItems.forEach((item) => {
   item.addEventListener("click", () => setView(item.dataset.view));
 });
