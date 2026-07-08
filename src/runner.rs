@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
 /// 内存与磁盘各自保留的最大 job 数量;超出后淘汰最早的已完成 job。
 const MAX_JOBS: usize = 200;
@@ -23,6 +24,20 @@ pub struct JobStore {
     jobs: Arc<Mutex<BTreeMap<String, JobSnapshot>>>,
     log_dir: Arc<PathBuf>,
     jobs_dir: Arc<PathBuf>,
+    events: broadcast::Sender<JobEvent>,
+}
+
+/// job 事件,通过 broadcast 通道推给所有 SSE 订阅者。
+#[derive(Clone, Debug)]
+pub enum JobEventKind {
+    Log(String),
+    Finished(JobStatus),
+}
+
+#[derive(Clone, Debug)]
+pub struct JobEvent {
+    pub job_id: String,
+    pub kind: JobEventKind,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -96,6 +111,7 @@ impl JobStore {
             jobs: Arc::new(Mutex::new(loaded)),
             log_dir: Arc::new(log_dir),
             jobs_dir: Arc::new(jobs_dir),
+            events: broadcast::channel(1024).0,
         };
         // 加载后立即裁剪到上限。
         {
@@ -151,6 +167,11 @@ impl JobStore {
             .cloned()
     }
 
+    /// 订阅 job 事件流(SSE 用)。
+    pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
+        self.events.subscribe()
+    }
+
     pub fn append(&self, id: &str, line: impl Into<String>) {
         let line = line.into();
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
@@ -158,19 +179,23 @@ impl JobStore {
             if let Some(log_path) = job.log_path.as_deref() {
                 append_line_to_file(Path::new(log_path), &line);
             }
-            job.logs.push(line);
+            job.logs.push(line.clone());
             if job.logs.len() > 1200 {
                 let overflow = job.logs.len() - 1200;
                 job.logs.drain(0..overflow);
             }
             write_job_file(&self.jobs_dir, job);
+            let _ = self.events.send(JobEvent {
+                job_id: id.to_string(),
+                kind: JobEventKind::Log(line),
+            });
         }
     }
 
     pub fn finish(&self, id: &str, status: JobStatus, exit_code: Option<i32>) {
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
         if let Some(job) = jobs.get_mut(id) {
-            job.status = status;
+            job.status = status.clone();
             job.exit_code = exit_code;
             job.finished_at = Some(now_string());
             if let Some(log_path) = job.log_path.as_deref() {
@@ -187,6 +212,10 @@ impl JobStore {
                 );
             }
             write_job_file(&self.jobs_dir, job);
+            let _ = self.events.send(JobEvent {
+                job_id: id.to_string(),
+                kind: JobEventKind::Finished(status),
+            });
         }
         self.enforce_limits(&mut jobs);
     }

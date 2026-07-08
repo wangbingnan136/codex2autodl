@@ -1,14 +1,17 @@
 use crate::paths::ProjectPaths;
 use crate::profile::{ProfileStatus, ProfileStore, SaveProfileRequest};
-use crate::runner::{self, JobAction, JobContext, JobStore};
+use crate::runner::{self, JobAction, JobContext, JobEventKind, JobStatus, JobStore};
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use std::convert::Infallible;
 use std::net::SocketAddr;
+use tokio_stream::StreamExt;
 
 const INDEX_HTML: &str = include_str!("static/index.html");
 const APP_CSS: &str = include_str!("static/app.css");
@@ -66,6 +69,7 @@ pub async fn serve(state: AppState, addr: SocketAddr, health_interval: u64) -> R
         .route("/api/profiles/{alias}/stop", post(stop_profile))
         .route("/api/active-remotes/repair", post(repair_active_remotes))
         .route("/api/jobs/{id}", get(get_job))
+        .route("/api/jobs/{id}/stream", get(stream_job))
         .with_state(state.clone());
 
     if health_interval > 0 {
@@ -167,6 +171,68 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     match state.jobs.get(&id) {
         Some(job) => Json(job).into_response(),
         None => api_error(StatusCode::NOT_FOUND, anyhow::anyhow!("job not found")),
+    }
+}
+
+/// SSE 端点:先补发该 job 已有日志快照,再持续推送增量,job 终态时发送
+/// `done` 事件并结束流。每条日志作为一个 `log` 事件,状态收尾为 `done` 事件。
+async fn stream_job(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(snapshot) = state.jobs.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, anyhow::anyhow!("job not found"));
+    };
+
+    // 订阅要在读取快照之前建立,避免快照与订阅之间丢事件;这里顺序为
+    // subscribe -> 取快照,快照里已有的行照常补发,少量重复由前端按序容忍。
+    let receiver = state.jobs.subscribe();
+    let already_terminal = snapshot.status != JobStatus::Running;
+
+    // 起始事件:补发已有日志 + 当前状态。
+    let initial_logs = snapshot.logs.clone();
+    let initial_stream = tokio_stream::iter(
+        initial_logs
+            .into_iter()
+            .map(|line| Ok::<Event, Infallible>(Event::default().event("log").data(line)))
+            .collect::<Vec<_>>(),
+    );
+
+    let target_id = id.clone();
+    let live_stream = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(
+        move |event| match event {
+            Ok(event) if event.job_id == target_id => match event.kind {
+                JobEventKind::Log(line) => Some(Ok::<Event, Infallible>(
+                    Event::default().event("log").data(line),
+                )),
+                JobEventKind::Finished(status) => {
+                    Some(Ok(Event::default().event("done").data(status_str(&status))))
+                }
+            },
+            _ => None,
+        },
+    );
+
+    let stream: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
+    > = if already_terminal {
+        // 已经结束的 job:补发日志后立即发 done。
+        Box::pin(
+            initial_stream.chain(tokio_stream::iter(vec![Ok(Event::default()
+                .event("done")
+                .data(status_str(&snapshot.status)))])),
+        )
+    } else {
+        Box::pin(initial_stream.chain(live_stream))
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn status_str(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Running => "running",
+        JobStatus::Succeeded => "succeeded",
+        JobStatus::Failed => "failed",
     }
 }
 

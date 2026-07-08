@@ -5,6 +5,7 @@ const state = {
   dataDir: "",
   pollTimer: null,
   listTimer: null,
+  sse: null,
 };
 
 const els = {
@@ -86,9 +87,9 @@ function renderActiveView() {
 
 const LIST_REFRESH_MS = 15000;
 
-// 仅在服务器视图、且没有 job 抽屉在轮询时,后台每 15s 静默刷新列表健康状态。
+// 仅在服务器视图、且没有 job 抽屉在轮询或 SSE 订阅时,后台每 15s 静默刷新列表健康状态。
 function updateListAutoRefresh() {
-  const shouldRun = state.view === "servers" && state.pollTimer === null;
+  const shouldRun = state.view === "servers" && state.pollTimer === null && state.sse === null;
   if (shouldRun && state.listTimer === null) {
     state.listTimer = setInterval(() => {
       loadProfiles().catch(() => {});
@@ -432,27 +433,91 @@ async function saveProfile({ connect = false } = {}) {
 
 function watchJob(job) {
   clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  stopSse();
   els.logDrawer.classList.add("open");
   renderJob(job);
 
-  state.pollTimer = setInterval(async () => {
-    const next = await api(`/api/jobs/${encodeURIComponent(job.id)}`);
-    renderJob(next);
-    if (next.status !== "running") {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
-      await loadProfiles();
-      updateListAutoRefresh();
-    }
-  }, 1000);
-  // job 轮询期间暂停列表定时刷新,结束后再恢复。
+  // 优先用 SSE 实时推送日志;不支持或建连失败时回退到 1 秒轮询。
+  if (typeof EventSource !== "undefined") {
+    watchJobViaSse(job);
+  } else {
+    watchJobViaPolling(job);
+  }
+  // job 观察期间暂停列表定时刷新,结束后再恢复。
   updateListAutoRefresh();
 }
 
+function stopSse() {
+  if (state.sse) {
+    state.sse.close();
+    state.sse = null;
+  }
+}
+
+async function finishJobWatch() {
+  if (state.pollTimer !== null) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  stopSse();
+  await loadProfiles();
+  updateListAutoRefresh();
+}
+
+function watchJobViaSse(job) {
+  // 增量拼接日志:renderJob 用整段,这里维护本地行缓冲逐条追加。
+  const lines = [...job.logs];
+  const source = new EventSource(`/api/jobs/${encodeURIComponent(job.id)}/stream`);
+  state.sse = source;
+  let fellBack = false;
+
+  source.addEventListener("log", (event) => {
+    lines.push(event.data);
+    renderJobLines(job, lines, "running");
+  });
+  source.addEventListener("done", async (event) => {
+    renderJobLines(job, lines, event.data);
+    await finishJobWatch();
+  });
+  source.onerror = () => {
+    // 建连或传输出错:关闭 SSE,回退轮询,避免浏览器无限自动重连。
+    if (fellBack) return;
+    fellBack = true;
+    stopSse();
+    watchJobViaPolling(job);
+  };
+}
+
+function watchJobViaPolling(job) {
+  state.pollTimer = setInterval(async () => {
+    let next;
+    try {
+      next = await api(`/api/jobs/${encodeURIComponent(job.id)}`);
+    } catch (error) {
+      return;
+    }
+    renderJob(next);
+    if (next.status !== "running") {
+      await finishJobWatch();
+    }
+  }, 1000);
+}
+
 function renderJob(job) {
-  els.jobState.textContent = job.status === "running" ? "运行中" : job.status === "succeeded" ? "完成" : "失败";
+  renderJobLines(job, job.logs, job.status);
+}
+
+function jobStateLabel(status) {
+  if (status === "running") return "运行中";
+  if (status === "succeeded") return "完成";
+  return "失败";
+}
+
+function renderJobLines(job, lines, status) {
+  els.jobState.textContent = jobStateLabel(status);
   els.jobTitle.textContent = `${job.alias} · ${actionLabel(job.action)}`;
-  els.jobLog.textContent = job.logs.join("\n");
+  els.jobLog.textContent = lines.join("\n");
   els.jobLog.scrollTop = els.jobLog.scrollHeight;
 }
 
@@ -538,6 +603,7 @@ els.closeLog.addEventListener("click", () => {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
+  stopSse();
   updateListAutoRefresh();
 });
 els.navItems.forEach((item) => {
