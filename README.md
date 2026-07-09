@@ -356,7 +356,9 @@ api tunnel watchdog: running pid=...
 api tunnel: healthy remote 127.0.0.1:8080
 ```
 
-如果 watchdog 不在，重新拉起：
+watchdog 由 macOS `launchd` 托管；它会守着 SSH 反向隧道，断了自动重连。健康检查优先看 SSH control socket，不依赖 AutoDL 远端有 `python3`。
+
+如果 watchdog 不在，重新拉起 LaunchAgent：
 
 ```bash
 ./scripts/setup-autodl-codex.sh --alias autodl-alz-v3 --local-api-port 8080 --diagnose

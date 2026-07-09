@@ -53,7 +53,7 @@ What it does:
   6. Installs Codex on the remote host from the npm CDN platform tarball when possible.
   7. Falls back to a locally cached GitHub release package upload when npm CDN install fails.
   8. Optionally writes proxy env vars to the remote shell profile and restarts remote Codex app-server.
-  9. Optionally starts a supervised SSH reverse tunnel from AutoDL back to your Mac local proxy/API port.
+  9. Optionally starts a launchd-supervised SSH reverse tunnel from AutoDL back to your Mac local proxy/API port.
   10. Optionally logs the remote Codex CLI in with an API key.
   11. Optionally points Codex at a local OpenAI-compatible API reverse proxy.
 
@@ -458,8 +458,7 @@ run_local_diagnostics() {
   else
     echo "api tunnel watchdog: not found"
   fi
-  if ssh -S "$api_control_path" -O check "$alias" >/dev/null 2>&1 &&
-    remote_loopback_port_open "$alias" "$REMOTE_API_PORT" "$api_control_path"; then
+  if remote_loopback_port_open "$alias" "$REMOTE_API_PORT" "$api_control_path"; then
     echo "api tunnel: healthy remote 127.0.0.1:$REMOTE_API_PORT"
   else
     echo "api tunnel: not healthy remote 127.0.0.1:$REMOTE_API_PORT"
@@ -476,8 +475,7 @@ run_local_diagnostics() {
     else
       echo "proxy tunnel watchdog: not found"
     fi
-    if ssh -S "$proxy_control_path" -O check "$alias" >/dev/null 2>&1 &&
-      remote_loopback_port_open "$alias" "$REMOTE_PROXY_PORT" "$proxy_control_path"; then
+    if remote_loopback_port_open "$alias" "$REMOTE_PROXY_PORT" "$proxy_control_path"; then
       echo "proxy tunnel: healthy remote 127.0.0.1:$REMOTE_PROXY_PORT"
     else
       echo "proxy tunnel: not healthy remote 127.0.0.1:$REMOTE_PROXY_PORT"
@@ -708,10 +706,32 @@ proxy_tunnel_watchdog_pid_path() {
   printf '%s/.ssh/codex2autodl-%s-proxy-%s.watchdog.pid' "$HOME" "$alias" "$remote_port"
 }
 
+proxy_tunnel_watchdog_runner_path() {
+  local alias="$1"
+  local remote_port="$2"
+  printf '%s/.ssh/codex2autodl-%s-proxy-%s.watchdog.sh' "$HOME" "$alias" "$remote_port"
+}
+
 proxy_tunnel_log_path() {
   local alias="$1"
   local remote_port="$2"
   printf '%s/.ssh/codex2autodl-%s-proxy-%s.watchdog.log' "$HOME" "$alias" "$remote_port"
+}
+
+proxy_tunnel_launchd_label() {
+  local alias="$1"
+  local remote_port="$2"
+  printf 'com.codex2autodl.tunnel.%s.proxy.%s' "$alias" "$remote_port"
+}
+
+proxy_tunnel_launchd_plist_path() {
+  local alias="$1"
+  local remote_port="$2"
+  printf '%s/Library/LaunchAgents/codex2autodl-%s-proxy-%s.plist' "$HOME" "$alias" "$remote_port"
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
 pid_is_running() {
@@ -772,18 +792,14 @@ case "$port" in
   ''|*[!0-9]*) exit 64 ;;
 esac
 
-if command -v python3 >/dev/null 2>&1; then
-  python3 -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3); s.close()' "$port"
-elif command -v python >/dev/null 2>&1; then
-  python -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3); s.close()' "$port"
-elif command -v nc >/dev/null 2>&1; then
-  nc -z -w 3 127.0.0.1 "$port"
-elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-  timeout 5 bash -lc ":</dev/tcp/127.0.0.1/$port"
-elif command -v curl >/dev/null 2>&1; then
+if command -v curl >/dev/null 2>&1; then
   curl -sS --connect-timeout 3 --max-time 5 -o /dev/null "http://127.0.0.1:$port/"
 elif command -v wget >/dev/null 2>&1; then
   wget -S -O /dev/null -T 5 "http://127.0.0.1:$port/" 2>&1 | grep -q 'HTTP/'
+elif command -v nc >/dev/null 2>&1; then
+  nc -z -w 3 127.0.0.1 "$port"
+elif command -v bash >/dev/null 2>&1; then
+  bash -lc ":</dev/tcp/127.0.0.1/$port"
 else
   exit 127
 fi
@@ -813,8 +829,7 @@ wait_for_reverse_proxy_tunnel() {
   local attempt
 
   for ((attempt = 1; attempt <= 20; attempt++)); do
-    if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1 &&
-      remote_loopback_port_open "$alias" "$remote_port" "$control_path"; then
+    if remote_loopback_port_open "$alias" "$remote_port" "$control_path"; then
       return 0
     fi
     sleep 1
@@ -835,6 +850,9 @@ remote_loopback_port_open() {
   )
 
   if [[ -n "$control_path" && -S "$control_path" ]]; then
+    if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+      return 0
+    fi
     ssh_args=(-S "$control_path" "${ssh_args[@]}")
   fi
 
@@ -874,69 +892,46 @@ cleanup_local_reverse_proxy_orphans() {
   return 0
 }
 
-start_reverse_proxy_tunnel() {
+write_reverse_proxy_watchdog_runner() {
   local alias="$1"
   local local_port="$2"
   local remote_port="$3"
-  local control_path
-  local pid_path
-  local log_path
-  local existing_pid=""
+  local control_path="$4"
+  local pid_path="$5"
+  local log_path="$6"
+  local runner_path="$7"
 
-  control_path="$(proxy_tunnel_control_path "$alias" "$remote_port")"
-  pid_path="$(proxy_tunnel_watchdog_pid_path "$alias" "$remote_port")"
-  log_path="$(proxy_tunnel_log_path "$alias" "$remote_port")"
-  mkdir -p "$HOME/.ssh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set +u\n'
+    printf 'CODEX_AUTODL_ALIAS=%s\n' "$(shell_quote "$alias")"
+    printf 'CODEX_AUTODL_LOCAL_PORT=%s\n' "$(shell_quote "$local_port")"
+    printf 'CODEX_AUTODL_REMOTE_PORT=%s\n' "$(shell_quote "$remote_port")"
+    printf 'CODEX_AUTODL_CONTROL_PATH=%s\n' "$(shell_quote "$control_path")"
+    printf 'CODEX_AUTODL_PID_PATH=%s\n' "$(shell_quote "$pid_path")"
+    printf 'CODEX_AUTODL_LOG_PATH=%s\n' "$(shell_quote "$log_path")"
+    printf 'CODEX_AUTODL_ALIVE_INTERVAL=%s\n' "$(shell_quote "$SSH_ALIVE_INTERVAL")"
+    printf 'CODEX_AUTODL_ALIVE_COUNT_MAX=%s\n' "$(shell_quote "$SSH_ALIVE_COUNT_MAX")"
+    printf 'CODEX_AUTODL_CONNECT_TIMEOUT=%s\n' "$(shell_quote "$SSH_CONNECT_TIMEOUT")"
+    printf 'CODEX_AUTODL_CHECK_INTERVAL=%s\n' "$(shell_quote "$TUNNEL_CHECK_INTERVAL")"
+    printf 'CODEX_AUTODL_RETRY_INTERVAL=%s\n' "$(shell_quote "$TUNNEL_RETRY_INTERVAL")"
+    printf 'CODEX_AUTODL_RETRY_MAX_INTERVAL=%s\n' "$(shell_quote "$TUNNEL_RETRY_MAX_INTERVAL")"
+    cat <<'WATCHDOG_RUNNER'
 
-  cleanup_stale_ssh_control_socket "$alias"
-  rotate_tunnel_log_if_needed "$log_path"
-
-  if [[ -f "$pid_path" ]]; then
-    existing_pid="$(cat "$pid_path" 2>/dev/null || true)"
-    if pid_is_running "$existing_pid"; then
-      echo "SSH reverse proxy tunnel watchdog is already running (pid $existing_pid)."
-      if wait_for_reverse_proxy_tunnel "$alias" "$remote_port" "$control_path"; then
-        echo "SSH reverse proxy tunnel is healthy: remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
-        return 0
-      fi
-
-      echo "Existing tunnel watchdog did not recover the tunnel; restarting watchdog..."
-      kill "$existing_pid" >/dev/null 2>&1 || true
-      sleep 1
-    fi
-    rm -f "$pid_path"
-  fi
-
-  if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
-    echo "SSH reverse proxy tunnel is already running; adding watchdog supervision:"
-  else
-    cleanup_local_reverse_proxy_orphans "$alias" "$local_port" "$remote_port" "$control_path"
-    rm -f "$control_path"
-    echo "Starting supervised SSH reverse proxy tunnel:"
-  fi
-
-  echo "  remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
-  echo "  watchdog log: $log_path"
-
-  CODEX_AUTODL_ALIAS="$alias" \
-    CODEX_AUTODL_LOCAL_PORT="$local_port" \
-    CODEX_AUTODL_REMOTE_PORT="$remote_port" \
-    CODEX_AUTODL_CONTROL_PATH="$control_path" \
-    CODEX_AUTODL_ALIVE_INTERVAL="$SSH_ALIVE_INTERVAL" \
-    CODEX_AUTODL_ALIVE_COUNT_MAX="$SSH_ALIVE_COUNT_MAX" \
-    CODEX_AUTODL_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT" \
-    CODEX_AUTODL_CHECK_INTERVAL="$TUNNEL_CHECK_INTERVAL" \
-    CODEX_AUTODL_RETRY_INTERVAL="$TUNNEL_RETRY_INTERVAL" \
-    CODEX_AUTODL_RETRY_MAX_INTERVAL="$TUNNEL_RETRY_MAX_INTERVAL" \
-    nohup bash -c '
-set +u
+mkdir -p "$(dirname "$CODEX_AUTODL_PID_PATH")" "$(dirname "$CODEX_AUTODL_LOG_PATH")"
+printf '%s\n' "$$" > "$CODEX_AUTODL_PID_PATH"
 retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
 
 log() {
-  printf "%s %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$*"
+  printf "%s %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$*" >>"$CODEX_AUTODL_LOG_PATH"
 }
 
-trap "rc=\$?; log watchdog-exiting-rc=\$rc-line=\$LINENO" EXIT HUP INT TERM
+cleanup_pid() {
+  rm -f "$CODEX_AUTODL_PID_PATH"
+}
+
+trap 'cleanup_pid; exit 0' HUP INT TERM
+trap cleanup_pid EXIT
 
 cleanup_local_orphans() {
   local reverse_spec="-R 127.0.0.1:${CODEX_AUTODL_REMOTE_PORT}:127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}"
@@ -998,11 +993,152 @@ while :; do
       retry_interval="$CODEX_AUTODL_RETRY_MAX_INTERVAL"
     fi
   fi
-
 done
-' >>"$log_path" 2>&1 &
+WATCHDOG_RUNNER
+  } >"$runner_path"
+  chmod 0755 "$runner_path"
+}
 
-  printf '%s\n' "$!" > "$pid_path"
+stop_reverse_proxy_launchd() {
+  local alias="$1"
+  local remote_port="$2"
+  local label
+  local plist_path
+  local runner_path
+  local domain=""
+
+  label="$(proxy_tunnel_launchd_label "$alias" "$remote_port")"
+  plist_path="$(proxy_tunnel_launchd_plist_path "$alias" "$remote_port")"
+  runner_path="$(proxy_tunnel_watchdog_runner_path "$alias" "$remote_port")"
+
+  if command -v launchctl >/dev/null 2>&1; then
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    launchctl bootout "$domain" "$plist_path" >/dev/null 2>&1 || true
+    launchctl unload -w "$plist_path" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$plist_path" "$runner_path"
+}
+
+start_reverse_proxy_watchdog() {
+  local alias="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local control_path="$4"
+  local pid_path="$5"
+  local log_path="$6"
+  local runner_path
+  local plist_path
+  local label
+  local domain
+  local pid=""
+  local i
+
+  [[ "$(uname -s)" == "Darwin" ]] || die "macOS launchd is required for supervised reverse tunnels"
+  require_cmd launchctl
+
+  runner_path="$(proxy_tunnel_watchdog_runner_path "$alias" "$remote_port")"
+  plist_path="$(proxy_tunnel_launchd_plist_path "$alias" "$remote_port")"
+  label="$(proxy_tunnel_launchd_label "$alias" "$remote_port")"
+  domain="gui/$(id -u)"
+
+  mkdir -p "$HOME/.ssh" "$HOME/Library/LaunchAgents"
+  stop_reverse_proxy_launchd "$alias" "$remote_port"
+  write_reverse_proxy_watchdog_runner "$alias" "$local_port" "$remote_port" "$control_path" "$pid_path" "$log_path" "$runner_path"
+  cat >"$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "$label")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml_escape "$runner_path")</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "$HOME")</string>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "$log_path")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$log_path")</string>
+</dict>
+</plist>
+PLIST
+
+  if ! launchctl bootstrap "$domain" "$plist_path" >/dev/null 2>&1; then
+    launchctl load -w "$plist_path" >/dev/null 2>&1 || return 1
+  fi
+  launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
+
+  for ((i = 1; i <= 20; i++)); do
+    pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if pid_is_running "$pid"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  return 1
+}
+
+start_reverse_proxy_tunnel() {
+  local alias="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local control_path
+  local pid_path
+  local log_path
+  local plist_path
+  local existing_pid=""
+
+  control_path="$(proxy_tunnel_control_path "$alias" "$remote_port")"
+  pid_path="$(proxy_tunnel_watchdog_pid_path "$alias" "$remote_port")"
+  log_path="$(proxy_tunnel_log_path "$alias" "$remote_port")"
+  plist_path="$(proxy_tunnel_launchd_plist_path "$alias" "$remote_port")"
+  mkdir -p "$HOME/.ssh"
+
+  cleanup_stale_ssh_control_socket "$alias"
+  rotate_tunnel_log_if_needed "$log_path"
+
+  if [[ -f "$pid_path" ]]; then
+    existing_pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if pid_is_running "$existing_pid" && [[ -f "$plist_path" ]]; then
+      echo "SSH reverse proxy tunnel watchdog is already running (pid $existing_pid)."
+      if wait_for_reverse_proxy_tunnel "$alias" "$remote_port" "$control_path"; then
+        echo "SSH reverse proxy tunnel is healthy: remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
+        return 0
+      fi
+
+      echo "Existing tunnel watchdog did not recover the tunnel; restarting watchdog..."
+      sleep 1
+    fi
+    stop_reverse_proxy_launchd "$alias" "$remote_port"
+    pid_is_running "$existing_pid" && kill "$existing_pid" >/dev/null 2>&1 || true
+    rm -f "$pid_path"
+  fi
+
+  if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+    echo "SSH reverse proxy tunnel is already running; adding watchdog supervision:"
+  else
+    cleanup_local_reverse_proxy_orphans "$alias" "$local_port" "$remote_port" "$control_path"
+    rm -f "$control_path"
+    echo "Starting supervised SSH reverse proxy tunnel:"
+  fi
+
+  echo "  remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
+  echo "  watchdog log: $log_path"
+  echo "  launchd plist: $plist_path"
+
+  start_reverse_proxy_watchdog "$alias" "$local_port" "$remote_port" "$control_path" "$pid_path" "$log_path" ||
+    die "failed to start launchd watchdog: $plist_path"
 
   if wait_for_reverse_proxy_tunnel "$alias" "$remote_port" "$control_path"; then
     echo "SSH reverse proxy tunnel is healthy: remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
@@ -1020,6 +1156,8 @@ stop_reverse_proxy_tunnel() {
 
   control_path="$(proxy_tunnel_control_path "$alias" "$remote_port")"
   pid_path="$(proxy_tunnel_watchdog_pid_path "$alias" "$remote_port")"
+
+  stop_reverse_proxy_launchd "$alias" "$remote_port"
 
   if [[ -f "$pid_path" ]]; then
     existing_pid="$(cat "$pid_path" 2>/dev/null || true)"

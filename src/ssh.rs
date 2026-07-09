@@ -50,6 +50,8 @@ const CODEX_HOST_KEYED_MAPS: &[&str] = &[
 ];
 const SSH_BIN: &str = "/usr/bin/ssh";
 const KILL_BIN: &str = "/bin/kill";
+const LAUNCHCTL_BIN: &str = "/bin/launchctl";
+const ID_BIN: &str = "/usr/bin/id";
 
 pub fn validate_alias(alias: &str) -> Result<()> {
     if alias.is_empty()
@@ -221,6 +223,8 @@ pub fn remove_codex2autodl_alias(alias: &str) -> Result<SshHistoryCleanup> {
 }
 
 pub fn cleanup_alias_artifacts(alias: &str) -> Result<()> {
+    cleanup_alias_launch_agents(alias)?;
+
     let ssh_dir = home_dir()?.join(".ssh");
     let prefix = format!("codex2autodl-{alias}-proxy-");
     let Ok(entries) = fs::read_dir(&ssh_dir) else {
@@ -244,6 +248,85 @@ pub fn cleanup_alias_artifacts(alias: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cleanup_alias_launch_agents(alias: &str) -> Result<()> {
+    let launch_agents = home_dir()?.join("Library/LaunchAgents");
+    let Ok(entries) = fs::read_dir(&launch_agents) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(remote_port) = launch_agent_remote_port(&file_name, alias) else {
+            continue;
+        };
+
+        let path = entry.path();
+        bootout_launch_agent(&path, &proxy_tunnel_launchd_label(alias, remote_port));
+        let _ = fs::remove_file(path);
+    }
+
+    Ok(())
+}
+
+fn launch_agent_remote_port<'a>(file_name: &'a str, alias: &str) -> Option<&'a str> {
+    let prefix = format!("codex2autodl-{alias}-proxy-");
+    let remote_port = file_name.strip_prefix(&prefix)?.strip_suffix(".plist")?;
+    if !remote_port.is_empty() && remote_port.chars().all(|c| c.is_ascii_digit()) {
+        Some(remote_port)
+    } else {
+        None
+    }
+}
+
+fn proxy_tunnel_launchd_label(alias: &str, remote_port: &str) -> String {
+    format!("com.codex2autodl.tunnel.{alias}.proxy.{remote_port}")
+}
+
+fn launchd_domain() -> Option<String> {
+    let output = Command::new(ID_BIN)
+        .arg("-u")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let uid = String::from_utf8(output.stdout).ok()?;
+    let uid = uid.trim();
+    if uid.is_empty() {
+        None
+    } else {
+        Some(format!("gui/{uid}"))
+    }
+}
+
+fn bootout_launch_agent(plist_path: &PathBuf, label: &str) {
+    if let Some(domain) = launchd_domain() {
+        let _ = Command::new(LAUNCHCTL_BIN)
+            .arg("bootout")
+            .arg(format!("{domain}/{label}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new(LAUNCHCTL_BIN)
+            .arg("bootout")
+            .arg(&domain)
+            .arg(plist_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let _ = Command::new(LAUNCHCTL_BIN)
+        .args(["unload", "-w"])
+        .arg(plist_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn rewrite_codex2autodl_ssh_configs(remove_alias: Option<&str>) -> Result<SshHistoryCleanup> {
@@ -896,5 +979,29 @@ mod tests {
         assert!(validate_alias("-leading-dash").is_err());
         assert!(validate_alias("has space").is_err());
         assert!(validate_alias("bad/slash").is_err());
+    }
+
+    #[test]
+    fn launch_agent_remote_port_matches_exact_alias() {
+        assert_eq!(
+            launch_agent_remote_port("codex2autodl-box-proxy-8080.plist", "box"),
+            Some("8080")
+        );
+        assert_eq!(
+            launch_agent_remote_port("codex2autodl-box.extra-proxy-8080.plist", "box"),
+            None
+        );
+        assert_eq!(
+            launch_agent_remote_port("codex2autodl-box-proxy-api.plist", "box"),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_tunnel_launchd_label_matches_setup_script() {
+        assert_eq!(
+            proxy_tunnel_launchd_label("ccccc", "8080"),
+            "com.codex2autodl.tunnel.ccccc.proxy.8080"
+        );
     }
 }
