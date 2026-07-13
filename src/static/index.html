@@ -95,16 +95,37 @@
           <div class="field-grid">
             <label>
               <span>本地 API 端口</span>
-              <input name="local_api_port" type="number" min="1" max="65535" value="8080" />
+              <input name="local_api_port" type="number" min="1" max="65535" value="18990" />
             </label>
             <label>
               <span>远端 API 端口</span>
-              <input name="remote_api_port" type="number" min="1" max="65535" value="8080" />
+              <input name="remote_api_port" type="number" min="1" max="65535" value="18990" />
             </label>
           </div>
           <label>
             <span>API Key</span>
             <input name="api_key" type="password" autocomplete="new-password" />
+          </label>
+          <label>
+            <span>Provider 名称</span>
+            <input name="api_provider_name" autocomplete="off" value="claude-code-router" placeholder="codex2api / claude-code-router" />
+          </label>
+          <div class="field-grid">
+            <label>
+              <span>Wire API</span>
+              <select name="wire_api">
+                <option value="responses">responses</option>
+                <option value="chat">chat</option>
+              </select>
+            </label>
+            <label>
+              <span>默认模型</span>
+              <input name="model" autocomplete="off" value="codex2api/gpt-5.5" placeholder="codex2api/gpt-5.5" />
+            </label>
+          </div>
+          <label>
+            <span>模型 catalog 文件（本机路径，可选）</span>
+            <input name="model_catalog_path" autocomplete="off" value="~/.codex/ccr-model-catalog.json" placeholder="~/.codex/ccr-model-catalog.json" />
           </label>
           <label>
             <span>备注</span>

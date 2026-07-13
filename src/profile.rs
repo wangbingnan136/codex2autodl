@@ -26,6 +26,12 @@ pub struct Profile {
     pub local_api_port: u16,
     pub remote_api_port: u16,
     pub api_provider_name: String,
+    #[serde(default = "default_wire_api")]
+    pub wire_api: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_catalog_path: Option<String>,
     pub note: String,
     pub tags: Vec<String>,
     pub created_at: String,
@@ -54,6 +60,9 @@ pub struct SaveProfileRequest {
     pub local_api_port: Option<u16>,
     pub remote_api_port: Option<u16>,
     pub api_provider_name: Option<String>,
+    pub wire_api: Option<String>,
+    pub model: Option<String>,
+    pub model_catalog_path: Option<String>,
     pub note: Option<String>,
     pub tags: Option<Vec<String>>,
 }
@@ -98,6 +107,9 @@ impl ProfileStore {
                     local_api_port: 8080,
                     remote_api_port: 8080,
                     api_provider_name: "codex2api".to_string(),
+                    wire_api: default_wire_api(),
+                    model: None,
+                    model_catalog_path: None,
                     note: "Imported from ~/.ssh/config".to_string(),
                     tags: vec!["imported".to_string()],
                     created_at: now_string(),
@@ -218,6 +230,18 @@ impl ProfileStore {
                 .api_provider_name
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "codex2api".to_string()),
+            wire_api: request
+                .wire_api
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_wire_api),
+            model: request
+                .model
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            model_catalog_path: request
+                .model_catalog_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             note: request.note.unwrap_or_default(),
             tags: request.tags.unwrap_or_default(),
             created_at: existing
@@ -339,6 +363,10 @@ pub fn now_string() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+pub fn default_wire_api() -> String {
+    "responses".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +445,9 @@ mod tests {
                 local_api_port: Some(9090),
                 remote_api_port: None,
                 api_provider_name: None,
+                wire_api: None,
+                model: None,
+                model_catalog_path: None,
                 note: Some("hello".to_string()),
                 tags: Some(vec!["t1".to_string()]),
             })
@@ -449,6 +480,9 @@ mod tests {
                 local_api_port: None,
                 remote_api_port: None,
                 api_provider_name: None,
+                wire_api: None,
+                model: None,
+                model_catalog_path: None,
                 note: None,
                 tags: None,
             })

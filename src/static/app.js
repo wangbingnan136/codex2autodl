@@ -8,6 +8,17 @@ const state = {
   sse: null,
 };
 
+// 新增服务器时预填的默认配置：反代本机 claude-code-router (CCR)。
+// 换其他 provider 时，在表单里直接改这几个字段即可。
+const CCR_DEFAULTS = {
+  local_api_port: 18990,
+  remote_api_port: 18990,
+  api_provider_name: "claude-code-router",
+  wire_api: "responses",
+  model: "codex2api/gpt-5.5",
+  model_catalog_path: "~/.codex/ccr-model-catalog.json",
+};
+
 const els = {
   navItems: document.querySelectorAll(".nav-item"),
   viewTitle: document.querySelector("#view-title"),
@@ -387,8 +398,13 @@ function openPanel(profile = null) {
 
   els.form.alias.value = profile?.alias || "";
   els.form.ssh_command.value = profile?.ssh_command || "";
-  els.form.local_api_port.value = profile?.local_api_port || 8080;
-  els.form.remote_api_port.value = profile?.remote_api_port || 8080;
+  const d = profile ? {} : CCR_DEFAULTS;
+  els.form.local_api_port.value = profile?.local_api_port || d.local_api_port || 8080;
+  els.form.remote_api_port.value = profile?.remote_api_port || d.remote_api_port || 8080;
+  els.form.api_provider_name.value = profile?.api_provider_name || d.api_provider_name || "";
+  els.form.wire_api.value = profile?.wire_api || d.wire_api || "responses";
+  els.form.model.value = profile?.model || d.model || "";
+  els.form.model_catalog_path.value = profile?.model_catalog_path || d.model_catalog_path || "";
   els.form.note.value = profile?.note || "";
   els.form.ssh_password.placeholder = profile?.has_ssh_password ? "已保存，留空不修改" : "";
   els.form.api_key.placeholder = profile?.has_api_key ? "已保存，留空不修改" : "";
@@ -411,6 +427,10 @@ function formPayload() {
     api_key: data.api_key,
     local_api_port: Number(data.local_api_port || 8080),
     remote_api_port: Number(data.remote_api_port || data.local_api_port || 8080),
+    api_provider_name: (data.api_provider_name || "").trim(),
+    wire_api: data.wire_api || "responses",
+    model: (data.model || "").trim(),
+    model_catalog_path: (data.model_catalog_path || "").trim(),
     note: data.note.trim(),
     tags: [],
   };

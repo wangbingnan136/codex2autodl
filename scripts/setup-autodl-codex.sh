@@ -751,6 +751,26 @@ cleanup_stale_ssh_control_socket() {
   fi
 }
 
+reset_ssh_control_master() {
+  local alias="$1"
+  local control_path=""
+
+  control_path="$(ssh -G "$alias" 2>/dev/null | awk '$1 == "controlpath" { print $2; exit }')" || return 0
+  [[ -n "$control_path" && "$control_path" == *codex2autodl-* && -S "$control_path" ]] || return 0
+
+  echo "Resetting existing SSH control master: $control_path"
+  if ssh -S "$control_path" -O exit "$alias" >/dev/null 2>&1; then
+    for _ in {1..20}; do
+      [[ ! -S "$control_path" ]] && return 0
+      sleep 0.1
+    done
+  fi
+
+  if ! ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+    rm -f "$control_path"
+  fi
+}
+
 active_codex_remote_aliases() {
   ps -axo command= 2>/dev/null |
     awk '
@@ -844,18 +864,20 @@ remote_loopback_port_open() {
   local control_path="${3:-}"
   local ssh_args=(
     -o BatchMode=yes
+    -o ConnectionAttempts=1
+    -o ControlMaster=no
+    -o ControlPath=none
     -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT"
     -o "ServerAliveInterval=$SSH_ALIVE_INTERVAL"
     -o "ServerAliveCountMax=2"
   )
 
-  if [[ -n "$control_path" && -S "$control_path" ]]; then
-    if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
-      return 0
-    fi
-    ssh_args=(-S "$control_path" "${ssh_args[@]}")
+  if [[ -n "$control_path" ]]; then
+    [[ -S "$control_path" ]] || return 1
+    ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1 || return 1
   fi
 
+  # 独立连接做真实流量探测，避免把卡住的诊断 session 塞进隧道自己的 ControlMaster。
   remote_port_probe_script |
     ssh "${ssh_args[@]}" "$alias" "CODEX2AUTODL_PROBE_PORT=$(shell_quote "$remote_port") sh -s" >/dev/null 2>&1
 }
@@ -876,7 +898,7 @@ cleanup_local_reverse_proxy_orphans() {
     command="${line#* }"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ "$command" == *"ssh -fN"* ]] || continue
-    [[ "$command" == *" $alias"* ]] || continue
+    [[ "$command" == *" $alias" ]] || continue
     if [[ "$command" == *"$control_path"* ||
       "$command" == *"$reverse_spec"* ||
       "$command" == *"$compact_reverse_spec"* ]]; then
@@ -943,7 +965,7 @@ cleanup_local_orphans() {
     command="${line#* }"
     [ -n "$pid" ] || continue
     case "$command" in
-      *"ssh -fN"*"$CODEX_AUTODL_ALIAS"*)
+      *"ssh -fN"*"$CODEX_AUTODL_ALIAS")
         case "$command" in
           *"$CODEX_AUTODL_CONTROL_PATH"*|*"$reverse_spec"*|*"$compact_reverse_spec"*)
             kill "$pid" >/dev/null 2>&1 || true
@@ -1421,16 +1443,23 @@ configure_remote_api_provider() {
 
   [[ "$provider_name" =~ ^[A-Za-z0-9_-]+$ ]] || die "API provider name can only contain letters, numbers, underscore, and dash"
 
+  local remote_catalog_path=""
   if [[ "$clear_provider" -eq 1 ]]; then
     echo "Clearing remote API provider '$provider_name' from Codex config..."
   else
     [[ -n "$base_url" ]] || die "--api-base-url cannot be empty"
     [[ "$base_url" != *$'\n'* ]] || die "--api-base-url cannot contain newlines"
     echo "Writing remote API provider '$provider_name': $base_url"
+    if [[ -n "$MODEL_CATALOG_FILE" ]]; then
+      [[ -f "$MODEL_CATALOG_FILE" ]] || die "model catalog file not found: $MODEL_CATALOG_FILE"
+      remote_catalog_path="1"
+      echo "Uploading model catalog: $MODEL_CATALOG_FILE"
+      ssh "$alias" 'mkdir -p "$HOME/.codex" && umask 077 && cat > "$HOME/.codex/codex2autodl-model-catalog.json"' < "$MODEL_CATALOG_FILE"
+    fi
   fi
 
   ssh "$alias" \
-    "CODEX_AUTODL_API_PROVIDER_NAME=$(shell_quote "$provider_name") CODEX_AUTODL_API_BASE_URL=$(shell_quote "$base_url") CODEX_AUTODL_CLEAR_API_PROVIDER='$clear_provider' sh -s" <<'REMOTE_API_PROVIDER_CONFIG'
+    "CODEX_AUTODL_API_PROVIDER_NAME=$(shell_quote "$provider_name") CODEX_AUTODL_API_BASE_URL=$(shell_quote "$base_url") CODEX_AUTODL_CLEAR_API_PROVIDER='$clear_provider' CODEX_AUTODL_WIRE_API=$(shell_quote "$WIRE_API") CODEX_AUTODL_MODEL=$(shell_quote "$MODEL") CODEX_AUTODL_HAS_CATALOG=$(shell_quote "$remote_catalog_path") sh -s" <<'REMOTE_API_PROVIDER_CONFIG'
 set -eu
 
 config_dir="$HOME/.codex"
@@ -1439,10 +1468,16 @@ provider="$CODEX_AUTODL_API_PROVIDER_NAME"
 mkdir -p "$config_dir"
 touch "$config_file"
 chmod 0600 "$config_file" 2>/dev/null || true
+catalog_path=""
+if [ "${CODEX_AUTODL_HAS_CATALOG:-}" = "1" ]; then
+  catalog_path="$config_dir/codex2autodl-model-catalog.json"
+fi
 
 tmp="$config_file.codex2autodl.$$"
 awk -v provider="$provider" '
   BEGIN { skip = 0 }
+  /^[[:space:]]*model[[:space:]]*=/ { next }
+  /^[[:space:]]*model_catalog_json[[:space:]]*=/ { next }
   /^[[:space:]]*model_provider[[:space:]]*=/ { next }
   /^[[:space:]]*openai_base_url[[:space:]]*=/ { next }
   $0 == "[model_providers." provider "]" { skip = 1; next }
@@ -1454,13 +1489,20 @@ rm -f "$tmp"
 
 if [ "$CODEX_AUTODL_CLEAR_API_PROVIDER" != "1" ]; then
   tmp="$config_file.codex2autodl.root.$$"
+  wire_api="${CODEX_AUTODL_WIRE_API:-responses}"
   {
     printf '\nmodel_provider = "%s"\n' "$provider"
+    if [ -n "$CODEX_AUTODL_MODEL" ]; then
+      printf 'model = "%s"\n' "$CODEX_AUTODL_MODEL"
+    fi
+    if [ -n "$catalog_path" ]; then
+      printf 'model_catalog_json = "%s"\n' "$catalog_path"
+    fi
     cat "$config_file"
     printf '\n[model_providers.%s]\n' "$provider"
     printf 'name = "%s"\n' "$provider"
     printf 'base_url = "%s"\n' "$CODEX_AUTODL_API_BASE_URL"
-    printf 'wire_api = "responses"\n'
+    printf 'wire_api = "%s"\n' "$wire_api"
     printf 'requires_openai_auth = true\n'
   } > "$tmp"
   cat "$tmp" > "$config_file"
@@ -1517,6 +1559,9 @@ CLEAR_OPENAI_BASE_URL=0
 API_PROVIDER_NAME="codex2api"
 API_PROVIDER_BASE_URL=""
 CLEAR_API_PROVIDER=0
+WIRE_API="responses"
+MODEL=""
+MODEL_CATALOG_FILE=""
 API_KEY_PROMPT=0
 API_KEY_ENV_NAME=""
 API_KEY_FILE=""
@@ -1592,6 +1637,22 @@ while [[ $# -gt 0 ]]; do
     --api-provider-name)
       [[ $# -ge 2 ]] || die "--api-provider-name requires a value"
       API_PROVIDER_NAME="$2"
+      shift 2
+      ;;
+    --wire-api)
+      [[ $# -ge 2 ]] || die "--wire-api requires a value"
+      WIRE_API="$2"
+      shift 2
+      ;;
+    --model)
+      [[ $# -ge 2 ]] || die "--model requires a value"
+      MODEL="$2"
+      shift 2
+      ;;
+    --model-catalog-file)
+      [[ $# -ge 2 ]] || die "--model-catalog-file requires a file path"
+      MODEL_CATALOG_FILE="$2"
+      [[ "$MODEL_CATALOG_FILE" == "~/"* ]] && MODEL_CATALOG_FILE="$HOME/${MODEL_CATALOG_FILE#\~/}"
       shift 2
       ;;
     --clear-api-provider)
@@ -1732,6 +1793,11 @@ esac
 case "$API_SCHEME" in
   http|https) ;;
   *) die "--api-scheme must be one of: http, https" ;;
+esac
+
+case "$WIRE_API" in
+  responses|chat) ;;
+  *) die "--wire-api must be one of: responses, chat" ;;
 esac
 
 if [[ -n "$LOCAL_PROXY_SPEC" ]]; then
@@ -2073,6 +2139,8 @@ awk \
 
 rm -f "$TMP_CONFIG"
 chmod 600 "$CONFIG_FILE"
+
+reset_ssh_control_master "$ALIAS"
 
 echo "Verifying passwordless SSH..."
 if ssh -o BatchMode=yes -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$ALIAS" 'echo CODEX_AUTODL_SSH_OK' | grep -q 'CODEX_AUTODL_SSH_OK'; then

@@ -457,7 +457,6 @@ fn build_global_args(action: JobAction) -> Vec<String> {
             "--quick-reconnect-active".to_string(),
             "--local-api-port".to_string(),
             "8080".to_string(),
-            "--diagnose".to_string(),
         ],
         _ => unreachable!("global args are only supported for global actions"),
     }
@@ -487,6 +486,32 @@ fn build_args(
 
             args.push("--local-api-port".to_string());
             args.push(port_spec(profile));
+
+            args.push("--api-provider-name".to_string());
+            args.push(profile.api_provider_name.clone());
+
+            args.push("--wire-api".to_string());
+            args.push(profile.wire_api.clone());
+
+            if let Some(model) = profile
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+
+            if let Some(catalog) = profile
+                .model_catalog_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                args.push("--model-catalog-file".to_string());
+                args.push(catalog.to_string());
+            }
 
             if let Some(api_key) = secrets::get_secret(SecretKind::ApiKey, &profile.alias)? {
                 let file = write_temp_secret(job_id, "api-key", &api_key)?;
@@ -646,5 +671,11 @@ mod tests {
         assert!(dup2, "second running request for same alias should dedup");
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn automatic_repair_skips_slow_diagnostics() {
+        let args = build_global_args(JobAction::RepairActive);
+        assert!(!args.iter().any(|arg| arg == "--diagnose"));
     }
 }

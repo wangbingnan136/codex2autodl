@@ -326,7 +326,6 @@ Host autodl-alz-v3
 
 ```toml
 model_provider = "codex2api"
-model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
 
 [model_providers.codex2api]
@@ -336,7 +335,62 @@ wire_api = "responses"
 requires_openai_auth = true
 ```
 
+重写 provider 时会先清掉旧的 `model` / `model_provider` / `model_catalog_json` 行再重写：如果你在面板里填了“默认模型”，就写死成那个值；没填就交给当前 Codex App/CLI 选择。若老服务器的模型列表仍停在旧版本，重新点一次“连接”会同时升级远端 Codex；“修复隧道”只负责把隧道接通。
+
 `requires_openai_auth = true` 表示复用 Codex 的 API key 登录缓存。因为请求已经发到 `codex2api`，这里的 key 应该是你的 `codex2api` key，不是 OpenAI 官方 key。
+
+## 反代任意 provider（不止 codex2api）
+
+远端 provider 现在是可配置的，不再写死 `codex2api`。面板“新增/编辑服务器”里新增了四个字段：
+
+| 字段 | 作用 | 例子 |
+| --- | --- | --- |
+| Provider 名称 | 写进远端 `model_provider` 和 `[model_providers.*]` 段名 | `claude-code-router` |
+| Wire API | provider 的协议，OpenAI Responses 用 `responses`，普通 Chat 用 `chat` | `responses` |
+| 默认模型 | 直接写死远端 `model`，换模型不用重连才生效 | `codex2api/gpt-5.5` |
+| 模型 catalog 文件 | 本机 JSON 路径，连接时上传到远端并写 `model_catalog_json`，让 App 列出正确的模型 | `~/.codex/ccr-model-catalog.json` |
+
+这几件事最终写进远端 `~/.codex/config.toml`：
+
+```toml
+model_provider = "claude-code-router"
+model = "codex2api/gpt-5.5"
+model_catalog_json = "/root/.codex/codex2autodl-model-catalog.json"
+
+[model_providers.claude-code-router]
+name = "claude-code-router"
+base_url = "http://127.0.0.1:18990/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+关键点：base_url 由“本地 API 端口”自动推出来（`http://127.0.0.1:<远端端口>/v1`），所以你只要填**本地服务的端口 + key**，隧道和 provider 会一起接好。
+
+### 例子：反代 claude-code-router（CCR）
+
+CCR 监听 `127.0.0.1:18990`，key 是 CCR 自己生成的 `ccr-profile-...`（**别手抄**，从
+`~/.claude-code-router/profiles/<profile>/codex/config.toml` 里读当前值，它会轮换）。CCR 的模型名必须带命名空间，例如
+`codex2api/gpt-5.5`、`kiro-rs/claude-fable-5`，裸 `gpt-5.5` 会 `All target providers failed`。
+
+命令行版本：
+
+```bash
+./scripts/setup-autodl-codex.sh \
+  --alias autodl-ccr \
+  --ssh-password-prompt \
+  --local-api-port 18990 \
+  --api-provider-name claude-code-router \
+  --wire-api responses \
+  --model codex2api/gpt-5.5 \
+  --model-catalog-file ~/.codex/ccr-model-catalog.json \
+  --api-key-file /path/to/ccr.key \
+  --diagnose \
+  "ssh -p 51418 root@connect.westd.seetacloud.com"
+```
+
+`--api-provider-name / --wire-api / --model / --model-catalog-file` 都是可选的：不填就沿用默认的 `codex2api` + `responses`，行为和以前一致。
+
+CCR 默认使用它实时维护的 `~/.codex/ccr-model-catalog.json`。codex2autodl 会在每次点“连接”时把当前文件上传到远端；模型变化后重新点一次“连接”即可刷新菜单，“修复隧道”只接通网络，不刷新模型目录。
 
 ## 常见问题
 
