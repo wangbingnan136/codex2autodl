@@ -383,7 +383,7 @@ async fn run_job_inner(
     let mut temp_files = Vec::new();
     let args = match profile.as_ref() {
         Some(profile) => build_args(&ctx, profile, action, job_id, &mut temp_files)?,
-        None => build_global_args(action),
+        None => build_global_args(&ctx, action),
     };
 
     ctx.jobs.append(
@@ -451,15 +451,20 @@ async fn run_job_inner(
     }
 }
 
-fn build_global_args(action: JobAction) -> Vec<String> {
+fn build_global_args(ctx: &JobContext, action: JobAction) -> Vec<String> {
     match action {
-        JobAction::RepairActive => vec![
-            "--quick-reconnect-active".to_string(),
-            "--local-api-port".to_string(),
-            "8080".to_string(),
-        ],
+        JobAction::RepairActive => build_repair_active_args(&ctx.profiles.list()),
         _ => unreachable!("global args are only supported for global actions"),
     }
+}
+
+fn build_repair_active_args(profiles: &[Profile]) -> Vec<String> {
+    let mut args = vec!["--quick-reconnect-active".to_string()];
+    for profile in profiles {
+        args.push("--active-alias-port".to_string());
+        args.push(format!("{}={}", profile.alias, port_spec(profile)));
+    }
+    args
 }
 
 fn build_args(
@@ -487,33 +492,35 @@ fn build_args(
             args.push("--local-api-port".to_string());
             args.push(port_spec(profile));
 
-            args.push("--api-provider-name".to_string());
-            args.push(profile.api_provider_name.clone());
+            append_provider_args(&mut args, profile);
 
-            args.push("--wire-api".to_string());
-            args.push(profile.wire_api.clone());
+            let stored_api_key = secrets::get_secret(SecretKind::ApiKey, &profile.alias)?;
+            let api_key = if profile.api_provider_name == "claude-code-router" {
+                if let Some(current_api_key) = secrets::current_ccr_codex_api_key() {
+                    if stored_api_key.as_deref() != Some(current_api_key.as_str()) {
+                        if let Err(err) = secrets::set_secret(
+                            SecretKind::ApiKey,
+                            &profile.alias,
+                            &current_api_key,
+                        ) {
+                            ctx.jobs.append(
+                                job_id,
+                                format!("警告：CCR 当前 Key 已检测到，但写入 Keychain 失败：{err}"),
+                            );
+                        } else {
+                            ctx.jobs
+                                .append(job_id, "已从 CCR 数据库刷新当前 Codex API Key");
+                        }
+                    }
+                    Some(current_api_key)
+                } else {
+                    stored_api_key
+                }
+            } else {
+                stored_api_key
+            };
 
-            if let Some(model) = profile
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                args.push("--model".to_string());
-                args.push(model.to_string());
-            }
-
-            if let Some(catalog) = profile
-                .model_catalog_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                args.push("--model-catalog-file".to_string());
-                args.push(catalog.to_string());
-            }
-
-            if let Some(api_key) = secrets::get_secret(SecretKind::ApiKey, &profile.alias)? {
+            if let Some(api_key) = api_key {
                 let file = write_temp_secret(job_id, "api-key", &api_key)?;
                 args.push("--api-key-file".to_string());
                 args.push(file.display().to_string());
@@ -531,6 +538,7 @@ fn build_args(
         JobAction::Diagnose => {
             args.push("--local-api-port".to_string());
             args.push(port_spec(profile));
+            append_provider_args(&mut args, profile);
             args.push("--diagnose".to_string());
         }
         JobAction::StopTunnel => {
@@ -551,6 +559,34 @@ fn build_args(
     }
 
     Ok(args)
+}
+
+fn append_provider_args(args: &mut Vec<String>, profile: &Profile) {
+    args.push("--api-provider-name".to_string());
+    args.push(profile.api_provider_name.clone());
+
+    args.push("--wire-api".to_string());
+    args.push(profile.wire_api.clone());
+
+    if let Some(model) = profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+
+    if let Some(catalog) = profile
+        .model_catalog_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--model-catalog-file".to_string());
+        args.push(catalog.to_string());
+    }
 }
 
 fn port_spec(profile: &Profile) -> String {
@@ -675,7 +711,72 @@ mod tests {
 
     #[test]
     fn automatic_repair_skips_slow_diagnostics() {
-        let args = build_global_args(JobAction::RepairActive);
+        let args = build_repair_active_args(&[]);
         assert!(!args.iter().any(|arg| arg == "--diagnose"));
+    }
+
+    #[test]
+    fn automatic_repair_uses_each_profile_port_spec() {
+        let args = build_repair_active_args(&[
+            test_profile("codex2api-box", 8080, 8080),
+            test_profile("ccr-box", 18990, 19000),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                "--quick-reconnect-active",
+                "--active-alias-port",
+                "codex2api-box=8080",
+                "--active-alias-port",
+                "ccr-box=18990:19000",
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnose_provider_args_preserve_ccr_settings() {
+        let mut profile = test_profile("ccr-box", 18990, 18990);
+        profile.api_provider_name = "claude-code-router".to_string();
+        profile.model = Some("codex2api/gpt-5.6-sol".to_string());
+        profile.model_catalog_path = Some("~/.codex/ccr-model-catalog.json".to_string());
+
+        let mut args = Vec::new();
+        append_provider_args(&mut args, &profile);
+        assert_eq!(
+            args,
+            vec![
+                "--api-provider-name",
+                "claude-code-router",
+                "--wire-api",
+                "responses",
+                "--model",
+                "codex2api/gpt-5.6-sol",
+                "--model-catalog-file",
+                "~/.codex/ccr-model-catalog.json",
+            ]
+        );
+    }
+
+    fn test_profile(alias: &str, local_api_port: u16, remote_api_port: u16) -> Profile {
+        Profile {
+            alias: alias.to_string(),
+            ssh_command: format!("ssh {alias}"),
+            user: "root".to_string(),
+            host: alias.to_string(),
+            port: 22,
+            local_api_port,
+            remote_api_port,
+            api_provider_name: "codex2api".to_string(),
+            wire_api: "responses".to_string(),
+            model: None,
+            model_catalog_path: None,
+            note: String::new(),
+            tags: Vec::new(),
+            created_at: crate::profile::now_string(),
+            updated_at: crate::profile::now_string(),
+            last_connected_at: None,
+            last_status: ProfileStatus::New,
+            last_message: String::new(),
+        }
     }
 }

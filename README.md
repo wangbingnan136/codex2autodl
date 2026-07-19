@@ -368,8 +368,10 @@ requires_openai_auth = true
 
 ### 例子：反代 claude-code-router（CCR）
 
-CCR 监听 `127.0.0.1:18990`，key 是 CCR 自己生成的 `ccr-profile-...`（**别手抄**，从
-`~/.claude-code-router/profiles/<profile>/codex/config.toml` 里读当前值，它会轮换）。CCR 的模型名必须带命名空间，例如
+CCR 监听 `127.0.0.1:18990`，key 是 CCR 自己生成的 `ccr-profile-...`。新版 CCR 把
+Codex profile key 存在 `~/.claude-code-router/app-data/api-keys.sqlite` 的
+`profile:default-codex` 记录中；连接 CCR profile 时，控制面板会自动读取当前值并刷新
+Keychain，重装或轮换后不需要手抄。CCR 的模型名必须带命名空间，例如
 `codex2api/gpt-5.5`、`kiro-rs/claude-fable-5`，裸 `gpt-5.5` 会 `All target providers failed`。
 
 命令行版本：
@@ -391,6 +393,13 @@ CCR 监听 `127.0.0.1:18990`，key 是 CCR 自己生成的 `ccr-profile-...`（*
 `--api-provider-name / --wire-api / --model / --model-catalog-file` 都是可选的：不填就沿用默认的 `codex2api` + `responses`，行为和以前一致。
 
 CCR 默认使用它实时维护的 `~/.codex/ccr-model-catalog.json`。codex2autodl 会在每次点“连接”时把当前文件上传到远端；模型变化后重新点一次“连接”即可刷新菜单，“修复隧道”只接通网络，不刷新模型目录。
+
+控制面板启动时会读取本机 `~/.codex/config.toml` 的当前 provider、端口、默认模型和
+`model_catalog_json`。旧版档案如果还没有 catalog 配置，会自动迁移到这套本机配置；
+新建或从 SSH config 导入的服务器也直接继承它，因此不再依赖写死的 CCR 端口和模型名。
+
+后台自动巡检会按每个服务器 profile 自己的本地/远端 API 端口修复隧道：CCR 可以使用
+`18990`，普通 codex2api 可以继续使用 `8080`，两者不会再被统一按 `8080` 重连。
 
 ## 常见问题
 

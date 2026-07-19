@@ -3,14 +3,13 @@ const state = {
   activeProfile: null,
   view: "servers",
   dataDir: "",
+  modelDefaults: null,
   pollTimer: null,
   listTimer: null,
   sse: null,
 };
 
-// 新增服务器时预填的默认配置：反代本机 claude-code-router (CCR)。
-// 换其他 provider 时，在表单里直接改这几个字段即可。
-const CCR_DEFAULTS = {
+const FALLBACK_MODEL_DEFAULTS = {
   local_api_port: 18990,
   remote_api_port: 18990,
   api_provider_name: "claude-code-router",
@@ -64,6 +63,7 @@ async function loadProfiles() {
   const body = await api("/api/profiles");
   state.profiles = body.profiles;
   state.dataDir = body.data_dir;
+  state.modelDefaults = body.model_defaults || FALLBACK_MODEL_DEFAULTS;
   els.count.textContent = String(state.profiles.length);
   renderActiveView();
 }
@@ -398,7 +398,7 @@ function openPanel(profile = null) {
 
   els.form.alias.value = profile?.alias || "";
   els.form.ssh_command.value = profile?.ssh_command || "";
-  const d = profile ? {} : CCR_DEFAULTS;
+  const d = profile ? {} : state.modelDefaults || FALLBACK_MODEL_DEFAULTS;
   els.form.local_api_port.value = profile?.local_api_port || d.local_api_port || 8080;
   els.form.remote_api_port.value = profile?.remote_api_port || d.remote_api_port || 8080;
   els.form.api_provider_name.value = profile?.api_provider_name || d.api_provider_name || "";

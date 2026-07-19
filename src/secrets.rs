@@ -1,7 +1,11 @@
+use crate::paths::home_dir;
 use anyhow::{Context, Result};
 use keyring::{Entry, Error};
+use std::process::{Command, Stdio};
 
 const SERVICE: &str = "codex2autodl";
+const CCR_CODEX_KEY_QUERY: &str = "SELECT encrypted_key FROM api_keys \
+WHERE id='profile:default-codex' AND encryption='plain' LIMIT 1;";
 
 #[derive(Clone, Copy)]
 pub enum SecretKind {
@@ -82,7 +86,60 @@ pub fn delete_secret(kind: SecretKind, alias: &str) -> Result<()> {
     }
 }
 
+pub fn current_ccr_codex_api_key() -> Option<String> {
+    let database = home_dir()
+        .ok()?
+        .join(".claude-code-router/app-data/api-keys.sqlite");
+    if !database.is_file() {
+        return None;
+    }
+
+    let output = Command::new("sqlite3")
+        .arg("-readonly")
+        .arg(database)
+        .arg(CCR_CODEX_KEY_QUERY)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_ccr_codex_api_key(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn parse_ccr_codex_api_key(output: &str) -> Option<String> {
+    let mut values = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let value = values.next()?;
+    if values.next().is_some() || !value.starts_with("ccr-profile-") {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 fn entry(kind: SecretKind, alias: &str) -> Result<Entry> {
     Entry::new(SERVICE, &format!("{}:{alias}", kind.account_prefix()))
         .with_context(|| "failed to open system keychain")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ccr_codex_api_key;
+
+    #[test]
+    fn parses_single_ccr_codex_key() {
+        assert_eq!(
+            parse_ccr_codex_api_key("ccr-profile-current_key\n").as_deref(),
+            Some("ccr-profile-current_key")
+        );
+    }
+
+    #[test]
+    fn rejects_non_ccr_or_multiple_keys() {
+        assert!(parse_ccr_codex_api_key("sk-not-ccr\n").is_none());
+        assert!(parse_ccr_codex_api_key("ccr-profile-one\nccr-profile-two\n").is_none());
+    }
 }

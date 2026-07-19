@@ -33,6 +33,7 @@ struct ApiError {
 struct ProfilesResponse {
     profiles: Vec<crate::profile::ProfileView>,
     data_dir: String,
+    model_defaults: crate::local_codex::LocalModelDefaults,
 }
 
 impl AppState {
@@ -127,6 +128,7 @@ async fn list_profiles(State(state): State<AppState>) -> Json<ProfilesResponse> 
     Json(ProfilesResponse {
         profiles: state.profiles.list_views(),
         data_dir: state.paths.data_dir.display().to_string(),
+        model_defaults: state.profiles.model_defaults(),
     })
 }
 

@@ -29,7 +29,7 @@ Usage:
   scripts/setup-autodl-codex.sh [--alias NAME] --stop-api-tunnel
   scripts/setup-autodl-codex.sh [--alias NAME] --stop-api-tunnel --local-api-port PORT
   scripts/setup-autodl-codex.sh [--alias NAME] --quick-reconnect --local-api-port PORT
-  scripts/setup-autodl-codex.sh --quick-reconnect-active --local-api-port PORT
+  scripts/setup-autodl-codex.sh --quick-reconnect-active [--active-alias-port ALIAS=LOCAL[:REMOTE]]... [--local-api-port PORT]
 
 Examples:
   scripts/setup-autodl-codex.sh --interactive --local-api-port 8080 --api-key-prompt
@@ -56,6 +56,7 @@ What it does:
   9. Optionally starts a launchd-supervised SSH reverse tunnel from AutoDL back to your Mac local proxy/API port.
   10. Optionally logs the remote Codex CLI in with an API key.
   11. Optionally points Codex at a local OpenAI-compatible API reverse proxy.
+  12. On connect, syncs local Codex skills (~/.codex/skills, ~/.agents/skills) to remote ~/.codex/skills (skip with --skip-local-skills).
 
 The password is read silently and is not saved to disk.
 EOF
@@ -537,6 +538,7 @@ config_file="$HOME/.codex/config.toml"
 openai_base_url=""
 model_provider=""
 provider_base_url=""
+provider_api_key=""
 if [ -f "$config_file" ]; then
   sed -n "1,220p" "$config_file" | sed -E 's/(api[_-]?key|token|secret|password)[[:space:]]*=[[:space:]]*"[^"]*"/\1 = "<redacted>"/Ig'
   openai_base_url="$(sed -n 's/^[[:space:]]*openai_base_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" | tail -n 1)"
@@ -556,6 +558,12 @@ if [ -f "$config_file" ]; then
   fi
 else
   echo "missing: $config_file"
+fi
+if [ -f "$HOME/.codex/auth.json" ]; then
+  provider_api_key="$(
+    tr -d '\n' < "$HOME/.codex/auth.json" |
+      sed -n 's/.*"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+  )"
 fi
 
 echo
@@ -582,7 +590,16 @@ if [ -n "$model_provider" ] && [ "$model_provider" != "openai" ]; then
     echo "-- configured provider base_url: $provider_base_url"
     provider_test_url="${provider_base_url%/}/models"
     if command -v curl >/dev/null 2>&1; then
-      curl -sS -i --connect-timeout 10 --max-time 20 "$provider_test_url" 2>&1 | sed -E "s/sk-[A-Za-z0-9_-]+/sk-<redacted>/g" | sed -n "1,16p"
+      if [ -n "$provider_api_key" ]; then
+        curl -sS -i --connect-timeout 10 --max-time 20 \
+          -H "Authorization: Bearer $provider_api_key" \
+          "$provider_test_url" 2>&1 |
+          sed -E "s/(sk|ccr-profile)-[A-Za-z0-9_-]+/\1-<redacted>/g" |
+          sed -n "1,16p"
+      else
+        curl -sS -i --connect-timeout 10 --max-time 20 "$provider_test_url" 2>&1 |
+          sed -n "1,16p"
+      fi
     elif command -v wget >/dev/null 2>&1; then
       wget --spider --timeout=20 "$provider_test_url" 2>&1 | sed -n "1,16p"
     else
@@ -595,7 +612,16 @@ if [ -n "$openai_base_url" ]; then
   echo "-- configured openai_base_url: $openai_base_url"
   api_test_url="${openai_base_url%/}/models"
   if command -v curl >/dev/null 2>&1; then
-    curl -sS -i --connect-timeout 10 --max-time 20 "$api_test_url" 2>&1 | sed -E "s/sk-[A-Za-z0-9_-]+/sk-<redacted>/g" | sed -n "1,16p"
+    if [ -n "$provider_api_key" ]; then
+      curl -sS -i --connect-timeout 10 --max-time 20 \
+        -H "Authorization: Bearer $provider_api_key" \
+        "$api_test_url" 2>&1 |
+        sed -E "s/(sk|ccr-profile)-[A-Za-z0-9_-]+/\1-<redacted>/g" |
+        sed -n "1,16p"
+    else
+      curl -sS -i --connect-timeout 10 --max-time 20 "$api_test_url" 2>&1 |
+        sed -n "1,16p"
+    fi
   elif command -v wget >/dev/null 2>&1; then
     wget --spider --timeout=20 "$api_test_url" 2>&1 | sed -n "1,16p"
   else
@@ -692,6 +718,74 @@ copy_local_auth_to_remote() {
   ssh "$alias" 'mkdir -p "$HOME/.codex" && umask 077 && cat > "$HOME/.codex/auth.json"' < "$auth_file"
   ssh "$alias" 'chmod 600 "$HOME/.codex/auth.json" && PATH="$HOME/.local/bin:/usr/local/bin:$PATH"; codex login status 2>&1 | sed -E "s/sk-[A-Za-z0-9_-]+/sk-<redacted>/g"'
   restart_remote_codex_app_server "$alias"
+}
+
+copy_skill_tree() {
+  local src="$1"
+  local dest="$2"
+
+  mkdir -p "$dest"
+  # -h: follow symlinks so remote gets real skill files, not broken Mac paths
+  tar -C "$src" -chf - . | tar -C "$dest" -xf -
+}
+
+collect_local_skills_into() {
+  local stage="$1"
+  local dir="$2"
+  local path name
+  local count=0
+
+  if [[ ! -d "$dir" ]]; then
+    printf '%s\n' 0
+    return 0
+  fi
+
+  for path in "$dir"/*; do
+    [[ -e "$path" ]] || continue
+    name="$(basename "$path")"
+    # skip hidden dirs like .system (bundled/system skills)
+    [[ "$name" == .* ]] && continue
+    [[ -d "$path" || -L "$path" ]] || continue
+    # only real skills
+    [[ -f "$path/SKILL.md" ]] || continue
+    # first source wins when same name exists in multiple roots
+    [[ -e "$stage/$name" ]] && continue
+
+    copy_skill_tree "$path" "$stage/$name"
+    count=$((count + 1))
+  done
+
+  printf '%s\n' "$count"
+}
+
+sync_local_skills_to_remote() {
+  local alias="$1"
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local stage total=0
+  local n
+
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/codex2autodl-skills.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap 'rm -rf "$stage"' RETURN
+
+  n="$(collect_local_skills_into "$stage" "$codex_home/skills")"
+  total=$((total + n))
+  n="$(collect_local_skills_into "$stage" "$HOME/.agents/skills")"
+  total=$((total + n))
+
+  if [[ "$total" -eq 0 ]]; then
+    echo "No local skills found under $codex_home/skills or ~/.agents/skills"
+    return 0
+  fi
+
+  echo "Uploading $total local skill(s) to remote ~/.codex/skills ..."
+  (
+    cd "$stage"
+    tar -czf - .
+  ) | ssh "$alias" 'mkdir -p "$HOME/.codex/skills" && tar -xzf - -C "$HOME/.codex/skills"'
+
+  echo "Remote skills now:"
+  ssh "$alias" 'ls -1 "$HOME/.codex/skills" 2>/dev/null || true'
 }
 
 proxy_tunnel_control_path() {
@@ -804,6 +898,20 @@ active_codex_remote_aliases() {
     awk '!seen[$0]++'
 }
 
+active_alias_port_spec() {
+  local alias="$1"
+  local mapping
+
+  (( ${#ACTIVE_ALIAS_PORT_SPECS[@]} > 0 )) || return 1
+  for mapping in "${ACTIVE_ALIAS_PORT_SPECS[@]}"; do
+    if [[ "${mapping%%=*}" == "$alias" ]]; then
+      printf '%s\n' "${mapping#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 remote_port_probe_script() {
   cat <<'REMOTE_PORT_PROBE'
 set -u
@@ -880,6 +988,68 @@ remote_loopback_port_open() {
   # 独立连接做真实流量探测，避免把卡住的诊断 session 塞进隧道自己的 ControlMaster。
   remote_port_probe_script |
     ssh "${ssh_args[@]}" "$alias" "CODEX2AUTODL_PROBE_PORT=$(shell_quote "$remote_port") sh -s" >/dev/null 2>&1
+}
+
+
+free_remote_reverse_port() {
+  # 远端残留 reverse-forward 占口时，新隧道会报
+  # "remote port forwarding failed for listen port N"。
+  # 只杀持有该 listen 的 sshd 会话，不动主 sshd。
+  local alias="$1"
+  local remote_port="$2"
+  local control_path="${3:-}"
+  local ssh_args=(
+    -o BatchMode=yes
+    -o ConnectionAttempts=1
+    -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT"
+    -o "ServerAliveInterval=$SSH_ALIVE_INTERVAL"
+    -o "ServerAliveCountMax=2"
+  )
+
+  if [[ -n "$control_path" ]] && ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
+    ssh_args=(-S "$control_path" "${ssh_args[@]}")
+  fi
+
+  ssh "${ssh_args[@]}" "$alias" "CODEX2AUTODL_FREE_PORT=$(shell_quote "$remote_port") sh -s" <<'REMOTE_FREE_PORT' >/dev/null 2>&1 || true
+set +e
+port="${CODEX2AUTODL_FREE_PORT:-}"
+case "$port" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+hex=$(printf '%04X' "$port" 2>/dev/null || true)
+[ -n "$hex" ] || exit 0
+
+inodes=""
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in
+    sl*) continue ;;
+  esac
+  la=$(echo "$line" | awk '{print $2}')
+  st=$(echo "$line" | awk '{print $4}')
+  inode=$(echo "$line" | awk '{print $10}')
+  port_hex=${la#*:}
+  port_hex=$(echo "$port_hex" | tr 'a-f' 'A-F')
+  [ "$port_hex" = "$hex" ] || continue
+  [ "$st" = "0A" ] || continue
+  [ -n "$inode" ] || continue
+  inodes="$inodes $inode"
+done < /proc/net/tcp 2>/dev/null
+
+for inode in $inodes; do
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    ls -l "$p/fd" 2>/dev/null | grep -q "socket:\[$inode\]" || continue
+    cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *"sshd: root@"*|*"sshd: "*@*)
+        kill -9 "$pid" 2>/dev/null || true
+        ;;
+    esac
+  done
+done
+REMOTE_FREE_PORT
 }
 
 cleanup_local_reverse_proxy_orphans() {
@@ -984,14 +1154,63 @@ EOF
   fi
 }
 
+remote_port_open() {
+  ssh -S "$CODEX_AUTODL_CONTROL_PATH" \
+    -o BatchMode=yes \
+    -o "ServerAliveInterval=$CODEX_AUTODL_ALIVE_INTERVAL" \
+    -o ServerAliveCountMax=2 \
+    "$CODEX_AUTODL_ALIAS" \
+    "port=$CODEX_AUTODL_REMOTE_PORT; if command -v nc >/dev/null 2>&1; then nc -z -w 3 127.0.0.1 \"\$port\"; elif command -v bash >/dev/null 2>&1; then bash -lc \":</dev/tcp/127.0.0.1/\$port\"; else exit 127; fi" \
+    >/dev/null 2>&1
+}
+
 while :; do
   if ssh -S "$CODEX_AUTODL_CONTROL_PATH" -O check "$CODEX_AUTODL_ALIAS" >/dev/null 2>&1; then
-    retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
-    sleep "$CODEX_AUTODL_CHECK_INTERVAL"
-    continue
+    if remote_port_open; then
+      retry_interval="$CODEX_AUTODL_RETRY_INTERVAL"
+      sleep "$CODEX_AUTODL_CHECK_INTERVAL"
+      continue
+    fi
+    log "control master alive but remote port closed; restarting tunnel"
+    ssh -S "$CODEX_AUTODL_CONTROL_PATH" -O exit "$CODEX_AUTODL_ALIAS" >/dev/null 2>&1 || true
+    sleep 1
   fi
 
   cleanup_local_orphans
+  # free remote reverse port if stale sshd still holds it
+  ssh -o BatchMode=yes -o ConnectTimeout="$CODEX_AUTODL_CONNECT_TIMEOUT" \
+    -o "ServerAliveInterval=$CODEX_AUTODL_ALIVE_INTERVAL" \
+    -o ServerAliveCountMax=2 \
+    "$CODEX_AUTODL_ALIAS" "port=$CODEX_AUTODL_REMOTE_PORT; sh -s" <<'FREEPORT' >/dev/null 2>&1 || true
+set +e
+case "$port" in ''|*[!0-9]*) exit 0 ;; esac
+hex=$(printf '%04X' "$port" 2>/dev/null || true)
+[ -n "$hex" ] || exit 0
+inodes=""
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in sl*) continue ;; esac
+  la=$(echo "$line" | awk '{print $2}')
+  st=$(echo "$line" | awk '{print $4}')
+  inode=$(echo "$line" | awk '{print $10}')
+  port_hex=${la#*:}
+  port_hex=$(echo "$port_hex" | tr 'a-f' 'A-F')
+  [ "$port_hex" = "$hex" ] || continue
+  [ "$st" = "0A" ] || continue
+  [ -n "$inode" ] || continue
+  inodes="$inodes $inode"
+done < /proc/net/tcp 2>/dev/null
+for inode in $inodes; do
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    ls -l "$p/fd" 2>/dev/null | grep -q "socket:\[$inode\]" || continue
+    cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *"sshd: root@"*|*"sshd: "*@*) kill -9 "$pid" 2>/dev/null || true ;;
+    esac
+  done
+done
+FREEPORT
   rm -f "$CODEX_AUTODL_CONTROL_PATH"
   log "reverse tunnel down; starting remote 127.0.0.1:${CODEX_AUTODL_REMOTE_PORT} -> local 127.0.0.1:${CODEX_AUTODL_LOCAL_PORT}"
   if ssh -fN -M -S "$CODEX_AUTODL_CONTROL_PATH" \
@@ -1155,6 +1374,7 @@ start_reverse_proxy_tunnel() {
     echo "Starting supervised SSH reverse proxy tunnel:"
   fi
 
+  free_remote_reverse_port "$alias" "$remote_port"
   echo "  remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
   echo "  watchdog log: $log_path"
   echo "  launchd plist: $plist_path"
@@ -1566,6 +1786,8 @@ API_KEY_PROMPT=0
 API_KEY_ENV_NAME=""
 API_KEY_FILE=""
 COPY_LOCAL_AUTH=0
+SYNC_LOCAL_SKILLS=1
+ACTIVE_ALIAS_PORT_SPECS=()
 SSH_ALIVE_INTERVAL=15
 SSH_ALIVE_COUNT_MAX=8
 SSH_CONNECT_TIMEOUT=15
@@ -1701,6 +1923,15 @@ while [[ $# -gt 0 ]]; do
       COPY_LOCAL_AUTH=1
       shift
       ;;
+    --skip-local-skills)
+      SYNC_LOCAL_SKILLS=0
+      shift
+      ;;
+    --active-alias-port)
+      [[ $# -ge 2 ]] || die "--active-alias-port requires ALIAS=LOCAL[:REMOTE]"
+      ACTIVE_ALIAS_PORT_SPECS+=("$2")
+      shift 2
+      ;;
     --diagnose)
       RUN_DIAGNOSE=1
       shift
@@ -1747,6 +1978,26 @@ if [[ "$QUICK_RECONNECT_ACTIVE" -eq 1 && ${#ARGS[@]} -gt 0 ]]; then
 fi
 if [[ "$QUICK_RECONNECT" -eq 1 && "$QUICK_RECONNECT_ACTIVE" -eq 1 ]]; then
   die "use only one of --quick-reconnect or --quick-reconnect-active"
+fi
+if (( ${#ACTIVE_ALIAS_PORT_SPECS[@]} > 0 )); then
+  for active_alias_port in "${ACTIVE_ALIAS_PORT_SPECS[@]}"; do
+    [[ "$active_alias_port" == *=* ]] || die "invalid --active-alias-port value: $active_alias_port"
+    active_alias_name="${active_alias_port%%=*}"
+    active_port_spec="${active_alias_port#*=}"
+    [[ "$active_alias_name" =~ ^[A-Za-z0-9._-]+$ && "$active_alias_name" != -* ]] ||
+      die "invalid alias in --active-alias-port: $active_alias_name"
+    if [[ "$active_port_spec" == *:* ]]; then
+      active_local_port="${active_port_spec%%:*}"
+      active_remote_port="${active_port_spec#*:}"
+    else
+      active_local_port="$active_port_spec"
+      active_remote_port="$active_port_spec"
+    fi
+    [[ "$active_local_port" =~ ^[0-9]+$ ]] ||
+      die "invalid local port in --active-alias-port: $active_alias_port"
+    [[ "$active_remote_port" =~ ^[0-9]+$ ]] ||
+      die "invalid remote port in --active-alias-port: $active_alias_port"
+  done
 fi
 if [[ "$SSH_PASSWORD_PROMPT" -eq 1 && -n "$SSH_PASSWORD_FILE" ]]; then
   die "--ssh-password-prompt and --ssh-password-file cannot be used together"
@@ -1862,10 +2113,21 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
 
     echo "Quick reconnect active API tunnel(s): ${active_aliases[*]}"
     for active_alias in "${active_aliases[@]}"; do
+      active_local_port="$LOCAL_API_PORT"
+      active_remote_port="$REMOTE_API_PORT"
+      if active_port_spec="$(active_alias_port_spec "$active_alias")"; then
+        if [[ "$active_port_spec" == *:* ]]; then
+          active_local_port="${active_port_spec%%:*}"
+          active_remote_port="${active_port_spec#*:}"
+        else
+          active_local_port="$active_port_spec"
+          active_remote_port="$active_port_spec"
+        fi
+      fi
       echo
-      echo "== repairing active alias: $active_alias"
+      echo "== repairing active alias: $active_alias ($active_local_port:$active_remote_port)"
       ensure_ssh_reliability_override "$active_alias"
-      start_reverse_proxy_tunnel "$active_alias" "$LOCAL_API_PORT" "$REMOTE_API_PORT"
+      start_reverse_proxy_tunnel "$active_alias" "$active_local_port" "$active_remote_port"
     done
 
     if [[ "$RUN_DIAGNOSE" -eq 1 ]]; then
@@ -1945,6 +2207,11 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
   elif [[ "$COPY_LOCAL_AUTH" -eq 1 ]]; then
     require_cmd ssh
     copy_local_auth_to_remote "$ALIAS"
+  fi
+
+  if [[ "$SYNC_LOCAL_SKILLS" -eq 1 && -n "$LOCAL_API_SPEC" && "$STOP_API_TUNNEL" -eq 0 ]]; then
+    require_cmd ssh
+    sync_local_skills_to_remote "$ALIAS"
   fi
 
   if [[ "$RUN_DIAGNOSE" -eq 1 ]]; then
@@ -2242,6 +2509,9 @@ if [[ "$SKIP_CODEX_INSTALL" -eq 0 ]]; then
 
   if [[ "$remote_codex_version" == "$latest_version" && "$remote_current_login_shell_ok" -eq 1 ]]; then
     echo "Remote Codex is already latest and visible to login shell: $remote_codex_version"
+  elif [[ -n "$remote_codex_version" && "$remote_current_login_shell_ok" -eq 1 ]]; then
+    # ponytail: keep working remote CLI; AutoDL often times out on 125MB npm package
+    echo "Remote Codex $remote_codex_version is usable; skipping optional upgrade to $latest_version."
   else
     if [[ -n "$remote_codex_version" ]]; then
       echo "Remote Codex version is $remote_codex_version; latest is $latest_version. Updating..."
@@ -2585,6 +2855,10 @@ elif [[ -n "$API_KEY_FILE" ]]; then
   unset REMOTE_CODEX_API_KEY
 elif [[ "$COPY_LOCAL_AUTH" -eq 1 ]]; then
   copy_local_auth_to_remote "$ALIAS"
+fi
+
+if [[ "$SYNC_LOCAL_SKILLS" -eq 1 ]]; then
+  sync_local_skills_to_remote "$ALIAS"
 fi
 
 echo

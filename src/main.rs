@@ -1,4 +1,5 @@
 mod http;
+mod local_codex;
 mod paths;
 mod profile;
 mod runner;

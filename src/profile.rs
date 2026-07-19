@@ -1,3 +1,4 @@
+use crate::local_codex::LocalModelDefaults;
 use crate::paths::ProjectPaths;
 use crate::secrets::{self, SecretKind};
 use crate::ssh::{self, TunnelState};
@@ -14,6 +15,7 @@ use time::format_description::well_known::Rfc3339;
 pub struct ProfileStore {
     path: Arc<std::path::PathBuf>,
     profiles: Arc<Mutex<BTreeMap<String, Profile>>>,
+    model_defaults: Arc<LocalModelDefaults>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ pub struct ProfileView {
 
 impl ProfileStore {
     pub fn load(paths: &ProjectPaths) -> Result<Self> {
+        let model_defaults = LocalModelDefaults::detect();
         let mut profiles = if paths.profiles_file.is_file() {
             let text = fs::read_to_string(&paths.profiles_file).with_context(|| {
                 format!(
@@ -93,6 +96,7 @@ impl ProfileStore {
         };
 
         for imported in ssh::import_managed_ssh_hosts() {
+            let defaults = model_defaults.clone();
             profiles
                 .entry(imported.alias.clone())
                 .or_insert_with(|| Profile {
@@ -104,12 +108,12 @@ impl ProfileStore {
                     user: imported.user,
                     host: imported.host,
                     port: imported.port,
-                    local_api_port: 8080,
-                    remote_api_port: 8080,
-                    api_provider_name: "codex2api".to_string(),
-                    wire_api: default_wire_api(),
-                    model: None,
-                    model_catalog_path: None,
+                    local_api_port: defaults.local_api_port,
+                    remote_api_port: defaults.remote_api_port,
+                    api_provider_name: defaults.api_provider_name,
+                    wire_api: defaults.wire_api,
+                    model: defaults.model,
+                    model_catalog_path: defaults.model_catalog_path,
                     note: "Imported from ~/.ssh/config".to_string(),
                     tags: vec!["imported".to_string()],
                     created_at: now_string(),
@@ -119,11 +123,13 @@ impl ProfileStore {
                     last_message: "等待连接".to_string(),
                 });
         }
+        migrate_missing_model_settings(&mut profiles, &model_defaults);
         reconcile_loaded_profile_statuses(&mut profiles);
 
         let store = Self {
             path: Arc::new(paths.profiles_file.clone()),
             profiles: Arc::new(Mutex::new(profiles)),
+            model_defaults: Arc::new(model_defaults),
         };
         store.persist()?;
         Ok(store)
@@ -145,15 +151,19 @@ impl ProfileStore {
                 std::thread::spawn(move || ssh::managed_tunnel_state(&alias, remote_port))
             })
             .collect::<Vec<_>>();
-        profiles
+        let mut dirty = false;
+        let views = profiles
             .into_iter()
             .zip(tunnel_checks)
-            .map(|(profile, tunnel_check)| {
+            .map(|(mut profile, tunnel_check)| {
                 let has_ssh_password = secrets::has_secret(SecretKind::SshPassword, &profile.alias);
                 let has_api_key = secrets::has_secret(SecretKind::ApiKey, &profile.alias);
                 let tunnel_state = tunnel_check
                     .join()
                     .unwrap_or(crate::ssh::TunnelState::Stale);
+                if heal_profile_status_from_tunnel(&mut profile, &tunnel_state) {
+                    dirty = true;
+                }
                 let health_score =
                     health_score(&profile.last_status, has_ssh_password, &tunnel_state);
                 ProfileView {
@@ -164,7 +174,21 @@ impl ProfileStore {
                     health_score,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        if dirty {
+            // 隧道已恢复健康时，把 failed/running 旧状态写回 connected，面板不长期显示 -1。
+            let mut profiles = self.profiles.lock().expect("profiles lock poisoned");
+            for view in &views {
+                if let Some(stored) = profiles.get_mut(&view.profile.alias) {
+                    *stored = view.profile.clone();
+                }
+            }
+            drop(profiles);
+            let _ = self.persist();
+        }
+
+        views
     }
 
     pub fn get(&self, alias: &str) -> Option<Profile> {
@@ -173,6 +197,19 @@ impl ProfileStore {
             .expect("profiles lock poisoned")
             .get(alias)
             .cloned()
+    }
+
+    pub fn list(&self) -> Vec<Profile> {
+        self.profiles
+            .lock()
+            .expect("profiles lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn model_defaults(&self) -> LocalModelDefaults {
+        self.model_defaults.as_ref().clone()
     }
 
     /// 是否存在"本应有隧道却掉线"的 profile(供后台健康巡检使用)。
@@ -215,6 +252,7 @@ impl ProfileStore {
 
         let mut profiles = self.profiles.lock().expect("profiles lock poisoned");
         let existing = profiles.get(alias).cloned();
+        let defaults = self.model_defaults.as_ref();
         let now = now_string();
         let profile = Profile {
             alias: alias.to_string(),
@@ -222,26 +260,45 @@ impl ProfileStore {
             user: target.user,
             host: target.host,
             port: target.port,
-            local_api_port: request.local_api_port.unwrap_or(8080),
+            local_api_port: request
+                .local_api_port
+                .or_else(|| existing.as_ref().map(|profile| profile.local_api_port))
+                .unwrap_or(defaults.local_api_port),
             remote_api_port: request
                 .remote_api_port
-                .unwrap_or_else(|| request.local_api_port.unwrap_or(8080)),
+                .or(request.local_api_port)
+                .or_else(|| existing.as_ref().map(|profile| profile.remote_api_port))
+                .unwrap_or(defaults.remote_api_port),
             api_provider_name: request
                 .api_provider_name
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "codex2api".to_string()),
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|profile| profile.api_provider_name.clone())
+                })
+                .unwrap_or_else(|| defaults.api_provider_name.clone()),
             wire_api: request
                 .wire_api
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(default_wire_api),
+                .or_else(|| existing.as_ref().map(|profile| profile.wire_api.clone()))
+                .unwrap_or_else(|| defaults.wire_api.clone()),
             model: request
                 .model
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+                .filter(|value| !value.is_empty())
+                .or_else(|| existing.as_ref().and_then(|profile| profile.model.clone()))
+                .or_else(|| defaults.model.clone()),
             model_catalog_path: request
                 .model_catalog_path
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|profile| profile.model_catalog_path.clone())
+                })
+                .or_else(|| defaults.model_catalog_path.clone()),
             note: request.note.unwrap_or_default(),
             tags: request.tags.unwrap_or_default(),
             created_at: existing
@@ -340,21 +397,55 @@ fn health_score(status: &ProfileStatus, has_password: bool, tunnel: &TunnelState
 
 fn reconcile_loaded_profile_statuses(profiles: &mut BTreeMap<String, Profile>) {
     for profile in profiles.values_mut() {
-        if profile.last_status != ProfileStatus::Running {
+        let tunnel = ssh::managed_tunnel_state(&profile.alias, profile.remote_api_port);
+        if heal_profile_status_from_tunnel(profile, &tunnel) {
             continue;
         }
 
-        if matches!(
-            ssh::managed_tunnel_state(&profile.alias, profile.remote_api_port),
-            TunnelState::Running
-        ) {
+        // 面板/任务中断后仍标 running，但隧道已不在，降成 stopped，避免永久“任务运行中”。
+        if profile.last_status == ProfileStatus::Running {
+            profile.last_status = ProfileStatus::Stopped;
+            profile.last_message = "上次任务未正常结束，隧道未运行".to_string();
+            profile.updated_at = now_string();
+        }
+    }
+}
+
+fn migrate_missing_model_settings(
+    profiles: &mut BTreeMap<String, Profile>,
+    defaults: &LocalModelDefaults,
+) {
+    for profile in profiles.values_mut() {
+        if profile.model_catalog_path.is_some() {
             continue;
         }
 
-        profile.last_status = ProfileStatus::Stopped;
-        profile.last_message = "上次任务未正常结束，隧道未运行".to_string();
+        profile.local_api_port = defaults.local_api_port;
+        profile.remote_api_port = defaults.remote_api_port;
+        profile.api_provider_name = defaults.api_provider_name.clone();
+        profile.wire_api = defaults.wire_api.clone();
+        profile.model = defaults.model.clone();
+        profile.model_catalog_path = defaults.model_catalog_path.clone();
         profile.updated_at = now_string();
     }
+}
+
+/// 隧道实际 Running 时，把 failed/running/stopped/new 等过期状态回写 connected。
+/// 返回 true 表示改动了 profile。
+fn heal_profile_status_from_tunnel(profile: &mut Profile, tunnel: &TunnelState) -> bool {
+    if !matches!(tunnel, TunnelState::Running) {
+        return false;
+    }
+    if profile.last_status == ProfileStatus::Connected {
+        return false;
+    }
+
+    let now = now_string();
+    profile.last_status = ProfileStatus::Connected;
+    profile.last_message = "隧道运行中".to_string();
+    profile.updated_at = now.clone();
+    profile.last_connected_at = Some(now);
+    true
 }
 
 pub fn now_string() -> String {
@@ -468,6 +559,51 @@ mod tests {
     }
 
     #[test]
+    fn heal_running_tunnel_marks_failed_profile_connected() {
+        let mut profile = Profile {
+            alias: "healme".to_string(),
+            ssh_command: "ssh healhost".to_string(),
+            user: "root".to_string(),
+            host: "healhost".to_string(),
+            port: 22,
+            local_api_port: 8080,
+            remote_api_port: 8080,
+            api_provider_name: "codex2api".to_string(),
+            wire_api: default_wire_api(),
+            model: None,
+            model_catalog_path: None,
+            note: String::new(),
+            tags: vec![],
+            created_at: now_string(),
+            updated_at: now_string(),
+            last_connected_at: None,
+            last_status: ProfileStatus::Failed,
+            last_message: "脚本退出码: -1".to_string(),
+        };
+
+        assert!(heal_profile_status_from_tunnel(
+            &mut profile,
+            &TunnelState::Running
+        ));
+        assert_eq!(profile.last_status, ProfileStatus::Connected);
+        assert_eq!(profile.last_message, "隧道运行中");
+        assert!(profile.last_connected_at.is_some());
+
+        // 已是 connected 时不再脏写。
+        assert!(!heal_profile_status_from_tunnel(
+            &mut profile,
+            &TunnelState::Running
+        ));
+        // 隧道不健康时不乱改状态。
+        profile.last_status = ProfileStatus::Failed;
+        assert!(!heal_profile_status_from_tunnel(
+            &mut profile,
+            &TunnelState::Stale
+        ));
+        assert_eq!(profile.last_status, ProfileStatus::Failed);
+    }
+
+    #[test]
     fn mark_status_connected_sets_last_connected() {
         let (paths, dir) = temp_paths();
         let store = ProfileStore::load(&paths).unwrap();
@@ -495,5 +631,49 @@ mod tests {
         assert!(profile.last_connected_at.is_some());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_legacy_profiles_to_current_local_model_defaults() {
+        let defaults = LocalModelDefaults {
+            local_api_port: 18890,
+            remote_api_port: 18890,
+            api_provider_name: "claude-code-router".to_string(),
+            wire_api: "responses".to_string(),
+            model: Some("codex2api/gpt-5.6-sol".to_string()),
+            model_catalog_path: Some("/Users/test/.codex/catalog.json".to_string()),
+        };
+        let mut profiles = BTreeMap::from([(
+            "legacy".to_string(),
+            Profile {
+                alias: "legacy".to_string(),
+                ssh_command: "ssh legacy".to_string(),
+                user: "root".to_string(),
+                host: "legacy".to_string(),
+                port: 22,
+                local_api_port: 8080,
+                remote_api_port: 8080,
+                api_provider_name: "codex2api".to_string(),
+                wire_api: default_wire_api(),
+                model: None,
+                model_catalog_path: None,
+                note: String::new(),
+                tags: vec![],
+                created_at: now_string(),
+                updated_at: now_string(),
+                last_connected_at: None,
+                last_status: ProfileStatus::New,
+                last_message: String::new(),
+            },
+        )]);
+
+        migrate_missing_model_settings(&mut profiles, &defaults);
+        let profile = profiles.get("legacy").unwrap();
+        assert_eq!(profile.local_api_port, 18890);
+        assert_eq!(profile.api_provider_name, "claude-code-router");
+        assert_eq!(
+            profile.model_catalog_path.as_deref(),
+            Some("/Users/test/.codex/catalog.json")
+        );
     }
 }
