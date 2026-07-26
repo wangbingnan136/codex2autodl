@@ -57,6 +57,7 @@ What it does:
   10. Optionally logs the remote Codex CLI in with an API key.
   11. Optionally points Codex at a local OpenAI-compatible API reverse proxy.
   12. On connect, syncs local Codex skills (~/.codex/skills, ~/.agents/skills) to remote ~/.codex/skills (skip with --skip-local-skills).
+  13. Installs enabled local plugins that also exist in a compatible remote marketplace (skip with --skip-local-plugins).
 
 The password is read silently and is not saved to disk.
 EOF
@@ -184,6 +185,34 @@ shell_quote() {
   printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
 }
 
+portable_sha256() {
+  local file="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | sed 's/^.*= //'
+  else
+    die "need shasum, sha256sum, or openssl to calculate SHA-256"
+  fi
+}
+
+portable_sha256_text() {
+  local value="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$value" | shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$value" | sha256sum | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$value" | openssl dgst -sha256 | sed 's/^.*= //'
+  else
+    die "need shasum, sha256sum, or openssl to calculate SHA-256"
+  fi
+}
+
 curl_retry() {
   local attempt
   local max_attempts=5
@@ -220,6 +249,27 @@ ssh_alias_configured() {
       exit(found ? 0 : 1)
     }
   ' "$CONFIG_FILE"
+}
+
+ssh_alias_matches_target() {
+  local alias="$1"
+  local expected_user="$2"
+  local expected_host="$3"
+  local expected_port="$4"
+  local expected_identity="$5"
+  local resolved
+
+  ssh_alias_configured "$alias" || return 1
+  resolved="$(ssh -G "$alias" 2>/dev/null)" || return 1
+  [[ "$(printf '%s\n' "$resolved" | awk '$1 == "user" { print $2; exit }')" == "$expected_user" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "hostname" { print $2; exit }')" == "$expected_host" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "port" { print $2; exit }')" == "$expected_port" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "identityfile" { print $2; exit }')" == "$expected_identity" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "serveraliveinterval" { print $2; exit }')" == "$SSH_ALIVE_INTERVAL" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "serveralivecountmax" { print $2; exit }')" == "$SSH_ALIVE_COUNT_MAX" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "tcpkeepalive" { print $2; exit }')" == "yes" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "ipqos" { print $2, $3; exit }')" == "none none" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "connecttimeout" { print $2; exit }')" == "$SSH_CONNECT_TIMEOUT" ]]
 }
 
 list_codex2autodl_aliases_for_target() {
@@ -419,6 +469,35 @@ resolve_latest_codex_version() {
   fi
 
   return 1
+}
+
+resolve_local_codex_binary() {
+  local candidate
+  local command_codex=""
+
+  command_codex="$(command -v codex 2>/dev/null || true)"
+  for candidate in \
+    "${CODEX_INSTALL_DIR:-}/codex" \
+    "/Applications/ChatGPT.app/Contents/Resources/codex" \
+    "/Applications/Codex.app/Contents/Resources/codex" \
+    "$command_codex"; do
+    [[ -n "$candidate" && "$candidate" != "/codex" && -x "$candidate" ]] || continue
+    if "$candidate" --version >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_desktop_codex_version() {
+  local codex_binary
+
+  codex_binary="$(resolve_local_codex_binary)" || return 1
+  "$codex_binary" --version 2>/dev/null |
+    sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' |
+    head -n 1
 }
 
 run_local_diagnostics() {
@@ -676,13 +755,76 @@ rm -f "$HOME/.codex/app-server-control/app-server-control.sock" \
       "$HOME/.codex/app-server-daemon/app-server.pid" \
       "$HOME/.codex/app-server-daemon/app-server-updater.pid" 2>/dev/null || true
 REMOTE_RESTART_APP_SERVER
+  REMOTE_APP_SERVER_RESTARTED=1
+}
+
+refresh_remote_codex_wrapper() {
+  local alias="$1"
+
+  ssh "$alias" 'sh -s' <<'REMOTE_REFRESH_CODEX_WRAPPER'
+set -eu
+bin_dir="$HOME/.local/bin"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+real_codex="$codex_home/packages/standalone/current/bin/codex"
+wrapper="$bin_dir/codex"
+
+[ -x "$real_codex" ] || exit 0
+mkdir -p "$bin_dir"
+
+if [ -f "$codex_home/codex2autodl-env" ]; then
+  tmp="$bin_dir/.codex.wrapper.$$"
+  cat > "$tmp" <<'WRAPPER'
+#!/bin/sh
+# codex2autodl wrapper
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+if [ -f "$codex_home/codex2autodl-env" ]; then
+  . "$codex_home/codex2autodl-env"
+fi
+exec "$codex_home/packages/standalone/current/bin/codex" "$@"
+WRAPPER
+  chmod 0755 "$tmp"
+  rm -f "$wrapper"
+  mv "$tmp" "$wrapper"
+elif [ -f "$wrapper" ] && grep -F "codex2autodl wrapper" "$wrapper" >/dev/null 2>&1; then
+  rm -f "$wrapper"
+  ln -s "$real_codex" "$wrapper"
+fi
+REMOTE_REFRESH_CODEX_WRAPPER
 }
 
 install_remote_api_key() {
   local alias="$1"
   local api_key="$2"
+  local api_key_digest
 
   [[ -n "$api_key" ]] || die "API key cannot be empty"
+  api_key_digest="$(portable_sha256_text "$api_key")"
+
+  if ssh "$alias" "CODEX_AUTODL_API_KEY_DIGEST=$(shell_quote "$api_key_digest") sh -s" <<'REMOTE_CHECK_API_KEY'
+set -eu
+auth_file="$HOME/.codex/auth.json"
+[ -f "$auth_file" ] || exit 1
+api_key="$(
+  tr -d '\n' < "$auth_file" |
+    sed -n 's/.*"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+)"
+[ -n "$api_key" ] || exit 1
+if command -v sha256sum >/dev/null 2>&1; then
+  digest="$(printf '%s' "$api_key" | sha256sum | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  digest="$(printf '%s' "$api_key" | shasum -a 256 | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+  digest="$(printf '%s' "$api_key" | openssl dgst -sha256 | sed 's/^.*= //')"
+else
+  exit 1
+fi
+unset api_key
+[ "$digest" = "$CODEX_AUTODL_API_KEY_DIGEST" ]
+REMOTE_CHECK_API_KEY
+  then
+    echo "Remote Codex API key already current; login and restart skipped."
+    return 0
+  fi
 
   echo "Logging remote Codex in with API key..."
   if printf '%s' "$api_key" | ssh "$alias" '
@@ -761,12 +903,12 @@ collect_local_skills_into() {
 sync_local_skills_to_remote() {
   local alias="$1"
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  local stage total=0
+  local stage manifest names manifest_digest total=0
   local n
 
   stage="$(mktemp -d "${TMPDIR:-/tmp}/codex2autodl-skills.XXXXXX")"
-  # shellcheck disable=SC2064
-  trap 'rm -rf "$stage"' RETURN
+  manifest="$stage.manifest"
+  names="$stage.names"
 
   n="$(collect_local_skills_into "$stage" "$codex_home/skills")"
   total=$((total + n))
@@ -774,18 +916,236 @@ sync_local_skills_to_remote() {
   total=$((total + n))
 
   if [[ "$total" -eq 0 ]]; then
-    echo "No local skills found under $codex_home/skills or ~/.agents/skills"
+    echo "No local skills found; removing only skills previously managed by codex2autodl."
+    ssh "$alias" 'sh -s' <<'REMOTE_CLEAR_MANAGED_SKILLS'
+set -eu
+skills_dir="$HOME/.codex/skills"
+names_file="$HOME/.codex/codex2autodl-skills.names"
+if [ -f "$names_file" ]; then
+  while IFS= read -r name; do
+    case "$name" in
+      ''|.*|*/*) continue ;;
+    esac
+    rm -rf "$skills_dir/$name"
+  done < "$names_file"
+fi
+rm -f "$HOME/.codex/codex2autodl-skills.manifest" \
+      "$HOME/.codex/codex2autodl-skills.digest" \
+      "$names_file"
+REMOTE_CLEAR_MANAGED_SKILLS
+    rm -rf "$stage" "$manifest" "$names"
     return 0
   fi
 
-  echo "Uploading $total local skill(s) to remote ~/.codex/skills ..."
+  require_cmd python3
+  : > "$names"
+  for path in "$stage"/*; do
+    [[ -d "$path" ]] || continue
+    basename "$path" >> "$names"
+  done
+  LC_ALL=C sort -o "$names" "$names"
+
+  CODEX_AUTODL_SKILLS_STAGE="$stage" python3 - "$manifest" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["CODEX_AUTODL_SKILLS_STAGE"])
+manifest = Path(sys.argv[1])
+lines = []
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    lines.append(f"{digest}  {path.relative_to(root).as_posix()}\n")
+manifest.write_text("".join(lines), encoding="utf-8")
+PY
+  manifest_digest="$(portable_sha256 "$manifest")"
+
+  if ssh "$alias" "CODEX_AUTODL_SKILLS_DIGEST=$(shell_quote "$manifest_digest") sh -s" <<'REMOTE_CHECK_SKILLS'
+set -eu
+command -v sha256sum >/dev/null 2>&1 || exit 1
+skills_dir="$HOME/.codex/skills"
+manifest="$HOME/.codex/codex2autodl-skills.manifest"
+digest_file="$HOME/.codex/codex2autodl-skills.digest"
+names_file="$HOME/.codex/codex2autodl-skills.names"
+[ -d "$skills_dir" ] &&
+  [ -f "$manifest" ] &&
+  [ -f "$digest_file" ] &&
+  [ -f "$names_file" ] &&
+  [ "$(cat "$digest_file")" = "$CODEX_AUTODL_SKILLS_DIGEST" ] ||
+  exit 1
+
+tmp_expected="/tmp/codex2autodl-skills-expected.$$"
+tmp_actual="/tmp/codex2autodl-skills-actual.$$"
+trap 'rm -f "$tmp_expected" "$tmp_actual"' EXIT
+sed 's/^[0-9a-fA-F]*  //' "$manifest" | LC_ALL=C sort > "$tmp_expected"
+(
+  cd "$skills_dir"
+  while IFS= read -r name; do
+    case "$name" in
+      ''|.*|*/*) continue ;;
+    esac
+    [ -d "$name" ] && find "$name" -type f -print
+  done < "$names_file"
+) | LC_ALL=C sort > "$tmp_actual"
+cmp -s "$tmp_expected" "$tmp_actual" || exit 1
+(cd "$skills_dir" && sha256sum -c "$manifest" >/dev/null 2>&1)
+REMOTE_CHECK_SKILLS
+  then
+    echo "Remote skills already current ($total skill(s)); upload skipped."
+    rm -rf "$stage" "$manifest" "$names"
+    return 0
+  fi
+
+  echo "Remote skills differ; syncing $total skill(s) ..."
+  ssh "$alias" 'sh -s' <<'REMOTE_REMOVE_OLD_MANAGED_SKILLS'
+set -eu
+skills_dir="$HOME/.codex/skills"
+names_file="$HOME/.codex/codex2autodl-skills.names"
+mkdir -p "$skills_dir"
+if [ -f "$names_file" ]; then
+  while IFS= read -r name; do
+    case "$name" in
+      ''|.*|*/*) continue ;;
+    esac
+    rm -rf "$skills_dir/$name"
+  done < "$names_file"
+fi
+REMOTE_REMOVE_OLD_MANAGED_SKILLS
+
   (
     cd "$stage"
     tar -czf - .
   ) | ssh "$alias" 'mkdir -p "$HOME/.codex/skills" && tar -xzf - -C "$HOME/.codex/skills"'
+  ssh "$alias" 'umask 077; cat > "$HOME/.codex/codex2autodl-skills.manifest"' < "$manifest"
+  ssh "$alias" 'umask 077; cat > "$HOME/.codex/codex2autodl-skills.names"' < "$names"
+  printf '%s\n' "$manifest_digest" |
+    ssh "$alias" 'umask 077; cat > "$HOME/.codex/codex2autodl-skills.digest"'
 
-  echo "Remote skills now:"
-  ssh "$alias" 'ls -1 "$HOME/.codex/skills" 2>/dev/null || true'
+  echo "Remote skills synchronized."
+  rm -rf "$stage" "$manifest" "$names"
+}
+
+collect_enabled_local_plugins() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local config_file="$codex_home/config.toml"
+  local codex_binary
+
+  codex_binary="$(resolve_local_codex_binary || true)"
+  if [[ -n "$codex_binary" ]] &&
+    "$codex_binary" plugin list 2>/dev/null |
+      awk '
+        $1 ~ /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/ && $0 ~ /installed, enabled/ {
+          version = $4
+          if (version ~ /^\// || version ~ /^https?:/) {
+            version = ""
+          }
+          print $1 "=" version
+        }
+      '; then
+    return 0
+  fi
+
+  [[ -f "$config_file" ]] || return 0
+  awk '
+    /^\[plugins\."/ {
+      plugin = $0
+      sub(/^\[plugins\."/, "", plugin)
+      sub(/"\][[:space:]]*$/, "", plugin)
+      in_plugin = 1
+      next
+    }
+    /^\[/ {
+      plugin = ""
+      in_plugin = 0
+    }
+    in_plugin == 1 && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true([[:space:]]*#.*)?$/ {
+      print plugin "="
+      plugin = ""
+      in_plugin = 0
+    }
+  ' "$config_file"
+}
+
+sync_compatible_plugins_to_remote() {
+  local alias="$1"
+  local plugins
+
+  plugins="$(collect_enabled_local_plugins | tr '\n' ' ')"
+  if [[ -z "${plugins// }" ]]; then
+    echo "No enabled local Codex plugins found."
+    return 0
+  fi
+
+  echo "Syncing remotely compatible Codex plugins..."
+  ssh "$alias" "CODEX_AUTODL_ENABLED_PLUGINS=$(shell_quote "$plugins") sh -s" <<'REMOTE_PLUGIN_SYNC'
+set +e
+PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Remote Codex is unavailable; plugin sync skipped." >&2
+  exit 0
+fi
+
+catalog="$(codex plugin list 2>/dev/null || true)"
+available="$(
+  printf '%s\n' "$catalog" |
+    awk '$1 ~ /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/ { print $1 }'
+)"
+enabled="$(
+  printf '%s\n' "$catalog" |
+    awk '$1 ~ /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/ && $0 ~ /installed, enabled/ { print $1 }'
+)"
+
+for requested_entry in $CODEX_AUTODL_ENABLED_PLUGINS; do
+  requested="${requested_entry%%=*}"
+  desired_version="${requested_entry#*=}"
+  plugin="$requested"
+  if ! printf '%s\n' "$available" | grep -Fx "$plugin" >/dev/null 2>&1; then
+    case "$plugin" in
+      *@openai-curated)
+        api_plugin="${plugin%@openai-curated}@openai-api-curated"
+        if printf '%s\n' "$available" | grep -Fx "$api_plugin" >/dev/null 2>&1; then
+          plugin="$api_plugin"
+        fi
+        ;;
+    esac
+  fi
+
+  if ! printf '%s\n' "$available" | grep -Fx "$plugin" >/dev/null 2>&1; then
+    echo "  skipped (not available on remote host): $requested"
+    continue
+  fi
+
+  plugin_line="$(printf '%s\n' "$catalog" | awk -v plugin="$plugin" '$1 == plugin { print; exit }')"
+  remote_version="$(printf '%s\n' "$plugin_line" | awk '{ print $4 }')"
+  case "$remote_version" in
+    ''|/*|http://*|https://*) remote_version="" ;;
+  esac
+  expected_version="$desired_version"
+  if [ -n "$remote_version" ]; then
+    expected_version="$remote_version"
+  fi
+
+  if printf '%s\n' "$enabled" | grep -Fx "$plugin" >/dev/null 2>&1 &&
+    { [ -z "$expected_version" ] || [ "$remote_version" = "$expected_version" ]; }; then
+    if [ -n "$remote_version" ]; then
+      echo "  already enabled: $plugin ($remote_version)"
+    else
+      echo "  already enabled: $plugin"
+    fi
+    continue
+  fi
+
+  if printf '%s\n' "$enabled" | grep -Fx "$plugin" >/dev/null 2>&1; then
+    codex plugin remove "$plugin" >/dev/null 2>&1 || true
+  fi
+  if codex plugin add "$plugin" >/dev/null 2>&1; then
+    echo "  installed/updated: $plugin${expected_version:+ ($expected_version)}"
+  else
+    echo "  warning: failed to install $plugin" >&2
+  fi
+done
+REMOTE_PLUGIN_SYNC
 }
 
 proxy_tunnel_control_path() {
@@ -1339,6 +1699,7 @@ start_reverse_proxy_tunnel() {
   local log_path
   local plist_path
   local existing_pid=""
+  local mapping_changed=0
 
   control_path="$(proxy_tunnel_control_path "$alias" "$remote_port")"
   pid_path="$(proxy_tunnel_watchdog_pid_path "$alias" "$remote_port")"
@@ -1346,12 +1707,17 @@ start_reverse_proxy_tunnel() {
   plist_path="$(proxy_tunnel_launchd_plist_path "$alias" "$remote_port")"
   mkdir -p "$HOME/.ssh"
 
+  # 每个 SSH alias 只保留当前端口的一条受管隧道。旧端口 watchdog 会持续
+  # 抢占 SSH 会话，拖慢 Desktop 的 1 秒模型能力探针，最终让模型菜单变灰。
+  cleanup_obsolete_reverse_proxy_tunnels "$alias" "$remote_port"
   cleanup_stale_ssh_control_socket "$alias"
   rotate_tunnel_log_if_needed "$log_path"
 
   if [[ -f "$pid_path" ]]; then
     existing_pid="$(cat "$pid_path" 2>/dev/null || true)"
-    if pid_is_running "$existing_pid" && [[ -f "$plist_path" ]]; then
+    if pid_is_running "$existing_pid" &&
+      [[ -f "$plist_path" ]] &&
+      reverse_proxy_watchdog_matches "$alias" "$local_port" "$remote_port"; then
       echo "SSH reverse proxy tunnel watchdog is already running (pid $existing_pid)."
       if wait_for_reverse_proxy_tunnel "$alias" "$remote_port" "$control_path"; then
         echo "SSH reverse proxy tunnel is healthy: remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
@@ -1360,10 +1726,18 @@ start_reverse_proxy_tunnel() {
 
       echo "Existing tunnel watchdog did not recover the tunnel; restarting watchdog..."
       sleep 1
+    elif pid_is_running "$existing_pid" && [[ -f "$plist_path" ]]; then
+      echo "Tunnel port mapping changed; restarting watchdog..."
+      mapping_changed=1
     fi
     stop_reverse_proxy_launchd "$alias" "$remote_port"
     pid_is_running "$existing_pid" && kill "$existing_pid" >/dev/null 2>&1 || true
     rm -f "$pid_path"
+  fi
+
+  if [[ "$mapping_changed" -eq 1 ]]; then
+    ssh -S "$control_path" -O exit "$alias" >/dev/null 2>&1 || true
+    rm -f "$control_path"
   fi
 
   if ssh -S "$control_path" -O check "$alias" >/dev/null 2>&1; then
@@ -1374,7 +1748,9 @@ start_reverse_proxy_tunnel() {
     echo "Starting supervised SSH reverse proxy tunnel:"
   fi
 
-  free_remote_reverse_port "$alias" "$remote_port"
+  if [[ "$mapping_changed" -ne 1 ]]; then
+    free_remote_reverse_port "$alias" "$remote_port"
+  fi
   echo "  remote 127.0.0.1:$remote_port -> local 127.0.0.1:$local_port"
   echo "  watchdog log: $log_path"
   echo "  launchd plist: $plist_path"
@@ -1387,6 +1763,19 @@ start_reverse_proxy_tunnel() {
   else
     echo "Warning: tunnel watchdog started, but the tunnel is not healthy yet. Check: tail -f $log_path" >&2
   fi
+}
+
+reverse_proxy_watchdog_matches() {
+  local alias="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local runner_path
+
+  runner_path="$(proxy_tunnel_watchdog_runner_path "$alias" "$remote_port")"
+  [[ -f "$runner_path" ]] || return 1
+  grep -Fqx "CODEX_AUTODL_ALIAS=$(shell_quote "$alias")" "$runner_path" &&
+    grep -Fqx "CODEX_AUTODL_LOCAL_PORT=$(shell_quote "$local_port")" "$runner_path" &&
+    grep -Fqx "CODEX_AUTODL_REMOTE_PORT=$(shell_quote "$remote_port")" "$runner_path"
 }
 
 stop_reverse_proxy_tunnel() {
@@ -1416,6 +1805,44 @@ stop_reverse_proxy_tunnel() {
     echo "No managed SSH reverse proxy tunnel found for remote port $remote_port."
   fi
   rm -f "$control_path"
+}
+
+managed_reverse_proxy_ports() {
+  local alias="$1"
+  local artifact
+  local name
+  local prefix="codex2autodl-${alias}-proxy-"
+  local suffix
+  local port
+
+  for artifact in \
+    "$HOME/Library/LaunchAgents/${prefix}"*.plist \
+    "$HOME/.ssh/${prefix}"*; do
+    [[ -e "$artifact" ]] || continue
+    name="${artifact##*/}"
+    [[ "$name" == "$prefix"* ]] || continue
+    suffix="${name#"$prefix"}"
+    port="${suffix%%.*}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    printf '%s\n' "$port"
+  done | awk '!seen[$0]++'
+}
+
+cleanup_obsolete_reverse_proxy_tunnels() {
+  local alias="$1"
+  local keep_remote_port="$2"
+  local obsolete_port
+  local artifact
+
+  while IFS= read -r obsolete_port; do
+    [[ -n "$obsolete_port" && "$obsolete_port" != "$keep_remote_port" ]] || continue
+    echo "Removing obsolete managed tunnel for $alias on remote port $obsolete_port..."
+    stop_reverse_proxy_tunnel "$alias" "$obsolete_port"
+    for artifact in "$HOME/.ssh/codex2autodl-${alias}-proxy-${obsolete_port}".*; do
+      [[ -e "$artifact" ]] || continue
+      rm -f "$artifact"
+    done
+  done < <(managed_reverse_proxy_ports "$alias")
 }
 
 remove_alias_tunnel_artifacts() {
@@ -1469,6 +1896,25 @@ configure_remote_proxy() {
   local clear_proxy="$3"
 
   if [[ "$clear_proxy" -eq 1 ]]; then
+    if ssh "$alias" 'sh -s' <<'REMOTE_PROXY_CLEAR_CHECK'
+set -eu
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+[ ! -e "$codex_home/codex2autodl-env" ] || exit 1
+wrapper="$HOME/.local/bin/codex"
+if [ -f "$wrapper" ] && grep -F "codex2autodl wrapper" "$wrapper" >/dev/null 2>&1; then
+  exit 1
+fi
+for profile in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.zprofile" "$HOME/.zshrc"; do
+  [ -f "$profile" ] || continue
+  if grep -F "# >>> codex2autodl proxy >>>" "$profile" >/dev/null 2>&1; then
+    exit 1
+  fi
+done
+REMOTE_PROXY_CLEAR_CHECK
+    then
+      echo "Remote proxy environment already clear; rewrite and restart skipped."
+      return 0
+    fi
     echo "Clearing codex2autodl proxy env block on remote host..."
   else
     [[ -n "$proxy_url" ]] || die "--proxy URL cannot be empty"
@@ -1519,46 +1965,6 @@ write_proxy_env_file() {
   chmod 0600 "$env_file"
 }
 
-install_codex_wrapper() {
-  bin_dir="$HOME/.local/bin"
-  codex_home="${CODEX_HOME:-$HOME/.codex}"
-  real_codex="$codex_home/packages/standalone/current/bin/codex"
-  wrapper="$bin_dir/codex"
-
-  if [ ! -x "$real_codex" ]; then
-    echo "Standalone Codex binary not found at $real_codex; shell profile proxy env was written, but wrapper was skipped." >&2
-    return 0
-  fi
-
-  mkdir -p "$bin_dir"
-  tmp="$bin_dir/.codex.wrapper.$$"
-  cat > "$tmp" <<'WRAPPER'
-#!/bin/sh
-# codex2autodl wrapper
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-if [ -f "$codex_home/codex2autodl-env" ]; then
-  . "$codex_home/codex2autodl-env"
-fi
-exec "$codex_home/packages/standalone/current/bin/codex" "$@"
-WRAPPER
-  chmod 0755 "$tmp"
-  rm -f "$wrapper"
-  mv "$tmp" "$wrapper"
-}
-
-restore_codex_symlink_if_wrapper() {
-  bin_dir="$HOME/.local/bin"
-  codex_home="${CODEX_HOME:-$HOME/.codex}"
-  real_codex="$codex_home/packages/standalone/current/bin/codex"
-  wrapper="$bin_dir/codex"
-
-  rm -f "$codex_home/codex2autodl-env"
-  if [ -f "$wrapper" ] && grep -F "codex2autodl wrapper" "$wrapper" >/dev/null 2>&1 && [ -x "$real_codex" ]; then
-    rm -f "$wrapper"
-    ln -s "$real_codex" "$wrapper"
-  fi
-}
-
 write_proxy_block() {
   file="$1"
   touch "$file"
@@ -1596,15 +2002,15 @@ for profile in $profiles; do
 done
 
 if [ "$CODEX_AUTODL_CLEAR_PROXY" = "1" ]; then
-  restore_codex_symlink_if_wrapper
+  rm -f "$HOME/.codex/codex2autodl-env"
   echo "Remote proxy env block cleared."
 else
   write_proxy_env_file
-  install_codex_wrapper
   echo "Remote proxy env block written."
 fi
 REMOTE_PROXY_CONFIG
 
+  refresh_remote_codex_wrapper "$alias"
   restart_remote_codex_app_server "$alias"
 }
 
@@ -1660,6 +2066,10 @@ configure_remote_api_provider() {
   local provider_name="$2"
   local base_url="$3"
   local clear_provider="$4"
+  local remote_model="$MODEL"
+  local prepared_catalog=""
+  local catalog_digest=""
+  local catalog_changed=0
 
   [[ "$provider_name" =~ ^[A-Za-z0-9_-]+$ ]] || die "API provider name can only contain letters, numbers, underscore, and dash"
 
@@ -1673,19 +2083,196 @@ configure_remote_api_provider() {
     if [[ -n "$MODEL_CATALOG_FILE" ]]; then
       [[ -f "$MODEL_CATALOG_FILE" ]] || die "model catalog file not found: $MODEL_CATALOG_FILE"
       remote_catalog_path="1"
-      echo "Uploading model catalog: $MODEL_CATALOG_FILE"
-      ssh "$alias" 'mkdir -p "$HOME/.codex" && umask 077 && cat > "$HOME/.codex/codex2autodl-model-catalog.json"' < "$MODEL_CATALOG_FILE"
+      prepared_catalog="$(mktemp "${TMPDIR:-/tmp}/codex2autodl-remote-catalog.XXXXXX")"
+      if [[ "$provider_name" == "claude-code-router" ]]; then
+        # Desktop whitelist prefers bare OpenAI model names.
+        # Infer CCR namespace prefixes from the current local catalog; do not hardcode.
+        if ! command -v python3 >/dev/null 2>&1; then
+          die "python3 is required on Mac to prepare remote CCR model catalog"
+        fi
+        MODEL_CATALOG_FILE="$MODEL_CATALOG_FILE" CODEX_AUTODL_MODEL="$remote_model" \
+          python3 - "$prepared_catalog" <<'PY'
+import json, os, re, sys
+src = os.environ["MODEL_CATALOG_FILE"]
+dst = sys.argv[1]
+default_model = os.environ.get("CODEX_AUTODL_MODEL", "") or ""
+openaiish = re.compile(r"^(gpt-|o[0-9]|chatgpt-|codex-|dall-e|gpt-image|text-embedding|omni-)")
+data = json.load(open(src, encoding="utf-8"))
+prefixes = set()
+if "/" in default_model:
+    prefixes.add(default_model.split("/", 1)[0] + "/")
+for item in data.get("models") or []:
+    slug = str((item or {}).get("slug") or (item or {}).get("id") or "")
+    if "/" not in slug:
+        continue
+    ns, rest = slug.split("/", 1)
+    if openaiish.match(rest) or (default_model and default_model.startswith(ns + "/")):
+        prefixes.add(ns + "/")
+prefixes = sorted(prefixes, key=len, reverse=True)
+
+def strip_text(value):
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+def walk(node):
+    if isinstance(node, dict):
+        return {k: walk(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [walk(v) for v in node]
+    if isinstance(node, str):
+        return strip_text(node)
+    return node
+
+prepared = walk(data)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(prepared, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+print("CCR remote catalog strip prefixes: " + (" ".join(prefixes) if prefixes else "(none)"))
+if default_model:
+    stripped = strip_text(default_model)
+    if stripped != default_model:
+        print("CCR remote default model: " + stripped)
+        with open(dst + ".model", "w", encoding="utf-8") as f:
+            f.write(stripped)
+PY
+        if [[ -f "$prepared_catalog.model" ]]; then
+          remote_model="$(cat "$prepared_catalog.model")"
+          rm -f "$prepared_catalog.model"
+        fi
+      else
+        cat "$MODEL_CATALOG_FILE" > "$prepared_catalog"
+      fi
+      catalog_digest="$(portable_sha256 "$prepared_catalog")"
+      if ssh "$alias" "CODEX_AUTODL_CATALOG_DIGEST=$(shell_quote "$catalog_digest") sh -s" <<'REMOTE_CHECK_MODEL_CATALOG'
+set -eu
+catalog="$HOME/.codex/codex2autodl-model-catalog.json"
+[ -f "$catalog" ] || exit 1
+if command -v sha256sum >/dev/null 2>&1; then
+  digest="$(sha256sum "$catalog" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  digest="$(shasum -a 256 "$catalog" | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+  digest="$(openssl dgst -sha256 "$catalog" | sed 's/^.*= //')"
+else
+  exit 1
+fi
+[ "$digest" = "$CODEX_AUTODL_CATALOG_DIGEST" ]
+REMOTE_CHECK_MODEL_CATALOG
+      then
+        echo "Remote model catalog already current; upload skipped."
+      else
+        echo "Remote model catalog differs; uploading: $MODEL_CATALOG_FILE"
+        ssh "$alias" 'mkdir -p "$HOME/.codex" && umask 077 && cat > "$HOME/.codex/codex2autodl-model-catalog.json"' < "$prepared_catalog"
+        catalog_changed=1
+      fi
     fi
   fi
 
+  if [[ "$provider_name" == "claude-code-router" && -z "${MODEL_CATALOG_FILE:-}" && "$remote_model" == */* ]]; then
+    # No catalog provided: strip one namespace from the current default model name.
+    remote_model="${remote_model#*/}"
+  fi
+
+  if [[ "$clear_provider" -ne 1 ]] &&
+    ssh "$alias" \
+      "CODEX_AUTODL_API_PROVIDER_NAME=$(shell_quote "$provider_name") CODEX_AUTODL_API_BASE_URL=$(shell_quote "$base_url") CODEX_AUTODL_WIRE_API=$(shell_quote "$WIRE_API") CODEX_AUTODL_MODEL=$(shell_quote "$remote_model") CODEX_AUTODL_HAS_CATALOG=$(shell_quote "$remote_catalog_path") sh -s" <<'REMOTE_CHECK_API_PROVIDER_CONFIG'
+set -eu
+config_file="$HOME/.codex/config.toml"
+provider="$CODEX_AUTODL_API_PROVIDER_NAME"
+[ -f "$config_file" ] || exit 1
+
+current_provider="$(sed -n 's/^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" | head -n 1)"
+current_model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" | head -n 1)"
+current_catalog="$(sed -n 's/^[[:space:]]*model_catalog_json[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" | head -n 1)"
+provider_values="$(
+  awk -v provider="$provider" '
+    $0 == "[model_providers." provider "]" { in_provider = 1; next }
+    in_provider == 1 && /^\[/ { exit }
+    in_provider == 1 {
+      if ($1 == "base_url") {
+        line = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", line)
+        sub(/".*/, "", line)
+        base_url = line
+      } else if ($1 == "wire_api") {
+        line = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", line)
+        sub(/".*/, "", line)
+        wire_api = line
+      } else if ($1 == "requires_openai_auth") {
+        line = $0
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        auth = line
+      }
+    }
+    END {
+      print base_url
+      print wire_api
+      print auth
+    }
+  ' "$config_file"
+)"
+current_base_url="$(printf '%s\n' "$provider_values" | sed -n '1p')"
+current_wire_api="$(printf '%s\n' "$provider_values" | sed -n '2p')"
+current_auth="$(printf '%s\n' "$provider_values" | sed -n '3p')"
+expected_catalog=""
+if [ "$CODEX_AUTODL_HAS_CATALOG" = "1" ]; then
+  expected_catalog="$HOME/.codex/codex2autodl-model-catalog.json"
+fi
+
+[ "$current_provider" = "$provider" ] &&
+  [ "$current_model" = "$CODEX_AUTODL_MODEL" ] &&
+  [ "$current_catalog" = "$expected_catalog" ] &&
+  [ "$current_base_url" = "$CODEX_AUTODL_API_BASE_URL" ] &&
+  [ "$current_wire_api" = "$CODEX_AUTODL_WIRE_API" ] &&
+  [ "$current_auth" = "true" ] &&
+  [ ! -e "$HOME/.codex/codex2autodl-model-proxy.pl" ] &&
+  [ ! -e "$HOME/.codex/codex2autodl-model-proxy-start" ] &&
+  [ ! -e "$HOME/.codex/codex2autodl-model-proxy.pid" ]
+REMOTE_CHECK_API_PROVIDER_CONFIG
+  then
+    if [[ "$catalog_changed" -eq 0 ]]; then
+      echo "Remote model/provider config already current; rewrite and restart skipped."
+      [[ -n "$prepared_catalog" ]] && rm -f "$prepared_catalog" "$prepared_catalog.model"
+      return 0
+    fi
+
+    echo "Remote provider config is current; restarting only because the model catalog changed."
+    [[ -n "$prepared_catalog" ]] && rm -f "$prepared_catalog" "$prepared_catalog.model"
+    refresh_remote_codex_wrapper "$alias"
+    restart_remote_codex_app_server "$alias"
+    return 0
+  fi
+
   ssh "$alias" \
-    "CODEX_AUTODL_API_PROVIDER_NAME=$(shell_quote "$provider_name") CODEX_AUTODL_API_BASE_URL=$(shell_quote "$base_url") CODEX_AUTODL_CLEAR_API_PROVIDER='$clear_provider' CODEX_AUTODL_WIRE_API=$(shell_quote "$WIRE_API") CODEX_AUTODL_MODEL=$(shell_quote "$MODEL") CODEX_AUTODL_HAS_CATALOG=$(shell_quote "$remote_catalog_path") sh -s" <<'REMOTE_API_PROVIDER_CONFIG'
+    "CODEX_AUTODL_API_PROVIDER_NAME=$(shell_quote "$provider_name") CODEX_AUTODL_API_BASE_URL=$(shell_quote "$base_url") CODEX_AUTODL_CLEAR_API_PROVIDER='$clear_provider' CODEX_AUTODL_WIRE_API=$(shell_quote "$WIRE_API") CODEX_AUTODL_MODEL=$(shell_quote "$remote_model") CODEX_AUTODL_HAS_CATALOG=$(shell_quote "$remote_catalog_path") sh -s" <<'REMOTE_API_PROVIDER_CONFIG'
 set -eu
 
 config_dir="$HOME/.codex"
 config_file="$config_dir/config.toml"
 provider="$CODEX_AUTODL_API_PROVIDER_NAME"
 mkdir -p "$config_dir"
+
+# 清理曾经试验过的远端模型前置代理，恢复 provider 直接走 SSH 反向隧道。
+legacy_proxy_pid="$config_dir/codex2autodl-model-proxy.pid"
+if [ -f "$legacy_proxy_pid" ]; then
+  pid="$(cat "$legacy_proxy_pid" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      ;;
+  esac
+fi
+rm -f "$config_dir/codex2autodl-model-proxy.pl" \
+      "$config_dir/codex2autodl-model-proxy-start" \
+      "$config_dir/codex2autodl-model-proxy.pid" \
+      "$config_dir/codex2autodl-model-proxy.log"
+
 touch "$config_file"
 chmod 0600 "$config_file" 2>/dev/null || true
 catalog_path=""
@@ -1733,6 +2320,8 @@ else
 fi
 REMOTE_API_PROVIDER_CONFIG
 
+  [[ -n "$prepared_catalog" ]] && rm -f "$prepared_catalog" "$prepared_catalog.model"
+  refresh_remote_codex_wrapper "$alias"
   restart_remote_codex_app_server "$alias"
 }
 
@@ -1787,6 +2376,9 @@ API_KEY_ENV_NAME=""
 API_KEY_FILE=""
 COPY_LOCAL_AUTH=0
 SYNC_LOCAL_SKILLS=1
+SYNC_LOCAL_PLUGINS=1
+REMOTE_CODEX_UPDATED=0
+REMOTE_APP_SERVER_RESTARTED=0
 ACTIVE_ALIAS_PORT_SPECS=()
 SSH_ALIVE_INTERVAL=15
 SSH_ALIVE_COUNT_MAX=8
@@ -1925,6 +2517,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-local-skills)
       SYNC_LOCAL_SKILLS=0
+      shift
+      ;;
+    --skip-local-plugins)
+      SYNC_LOCAL_PLUGINS=0
       shift
       ;;
     --active-alias-port)
@@ -2213,6 +2809,10 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
     require_cmd ssh
     sync_local_skills_to_remote "$ALIAS"
   fi
+  if [[ "$SYNC_LOCAL_PLUGINS" -eq 1 && -n "$LOCAL_API_SPEC" && "$STOP_API_TUNNEL" -eq 0 ]]; then
+    require_cmd ssh
+    sync_compatible_plugins_to_remote "$ALIAS"
+  fi
 
   if [[ "$RUN_DIAGNOSE" -eq 1 ]]; then
     require_cmd ssh
@@ -2338,76 +2938,80 @@ fi
 
 replace_existing_aliases_for_target "$USER" "$HOST" "$PORT" "$ALIAS"
 
-echo "Writing SSH config: $CONFIG_FILE"
-touch "$CONFIG_FILE"
-chmod 600 "$CONFIG_FILE"
+if ssh_alias_matches_target "$ALIAS" "$USER" "$HOST" "$PORT" "$KEY_FILE"; then
+  echo "SSH alias config already current; rewrite and control-master reset skipped."
+else
+  echo "Writing SSH config: $CONFIG_FILE"
+  touch "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
 
-TMP_CONFIG="$(mktemp)"
-awk \
-  -v alias="$ALIAS" \
-  -v reliability_begin="# >>> codex2autodl ssh reliability: $ALIAS >>>" \
-  -v reliability_end="# <<< codex2autodl ssh reliability: $ALIAS <<<" '
-  function flush_pending_marker() {
-    if (pending_marker != "") {
-      print pending_marker
-      pending_marker = ""
-    }
-  }
-  $0 == reliability_begin { reliability_skip = 1; next }
-  $0 == reliability_end { reliability_skip = 0; next }
-  reliability_skip == 1 { next }
-  /^# Added by codex2autodl setup script$/ {
-    pending_marker = $0
-    next
-  }
-  $1 == "Host" {
-    skip = 0
-    for (i = 2; i <= NF; i++) {
-      if ($i == alias) {
-        skip = 1
+  TMP_CONFIG="$(mktemp)"
+  awk \
+    -v alias="$ALIAS" \
+    -v reliability_begin="# >>> codex2autodl ssh reliability: $ALIAS >>>" \
+    -v reliability_end="# <<< codex2autodl ssh reliability: $ALIAS <<<" '
+    function flush_pending_marker() {
+      if (pending_marker != "") {
+        print pending_marker
+        pending_marker = ""
       }
     }
-    if (skip == 1) {
-      pending_marker = ""
+    $0 == reliability_begin { reliability_skip = 1; next }
+    $0 == reliability_end { reliability_skip = 0; next }
+    reliability_skip == 1 { next }
+    /^# Added by codex2autodl setup script$/ {
+      pending_marker = $0
       next
     }
-    flush_pending_marker()
-    print
-    next
-  }
-  skip != 1 {
-    flush_pending_marker()
-    print
-  }
-  END {
-    flush_pending_marker()
-  }
-' "$CONFIG_FILE" > "$TMP_CONFIG"
+    $1 == "Host" {
+      skip = 0
+      for (i = 2; i <= NF; i++) {
+        if ($i == alias) {
+          skip = 1
+        }
+      }
+      if (skip == 1) {
+        pending_marker = ""
+        next
+      }
+      flush_pending_marker()
+      print
+      next
+    }
+    skip != 1 {
+      flush_pending_marker()
+      print
+    }
+    END {
+      flush_pending_marker()
+    }
+  ' "$CONFIG_FILE" > "$TMP_CONFIG"
 
-{
-  printf "# Added by codex2autodl setup script\n"
-  printf "Host %s\n" "$ALIAS"
-  printf "  HostName %s\n" "$HOST"
-  printf "  User %s\n" "$USER"
-  printf "  Port %s\n" "$PORT"
-  printf "  IdentityFile %s\n" "$KEY_FILE"
-  printf "  IdentitiesOnly yes\n"
-  printf "  ServerAliveInterval %s\n" "$SSH_ALIVE_INTERVAL"
-  printf "  ServerAliveCountMax %s\n" "$SSH_ALIVE_COUNT_MAX"
-  printf "  TCPKeepAlive yes\n"
-  printf "  IPQoS none\n"
-  printf "  ConnectTimeout %s\n" "$SSH_CONNECT_TIMEOUT"
-  printf "  ControlMaster auto\n"
-  printf "  ControlPath %s/codex2autodl-%%C.sock\n" "$SSH_DIR"
-  printf "  ControlPersist %s\n" "$SSH_CONTROL_PERSIST"
-  printf "\n"
-  cat "$TMP_CONFIG"
-} > "$CONFIG_FILE"
+  {
+    printf "# Added by codex2autodl setup script\n"
+    printf "Host %s\n" "$ALIAS"
+    printf "  HostName %s\n" "$HOST"
+    printf "  User %s\n" "$USER"
+    printf "  Port %s\n" "$PORT"
+    printf "  IdentityFile %s\n" "$KEY_FILE"
+    printf "  IdentitiesOnly yes\n"
+    printf "  ServerAliveInterval %s\n" "$SSH_ALIVE_INTERVAL"
+    printf "  ServerAliveCountMax %s\n" "$SSH_ALIVE_COUNT_MAX"
+    printf "  TCPKeepAlive yes\n"
+    printf "  IPQoS none\n"
+    printf "  ConnectTimeout %s\n" "$SSH_CONNECT_TIMEOUT"
+    printf "  ControlMaster auto\n"
+    printf "  ControlPath %s/codex2autodl-%%C.sock\n" "$SSH_DIR"
+    printf "  ControlPersist %s\n" "$SSH_CONTROL_PERSIST"
+    printf "\n"
+    cat "$TMP_CONFIG"
+  } > "$CONFIG_FILE"
 
-rm -f "$TMP_CONFIG"
-chmod 600 "$CONFIG_FILE"
+  rm -f "$TMP_CONFIG"
+  chmod 600 "$CONFIG_FILE"
 
-reset_ssh_control_master "$ALIAS"
+  reset_ssh_control_master "$ALIAS"
+fi
 
 echo "Verifying passwordless SSH..."
 if ssh -o BatchMode=yes -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" "$ALIAS" 'echo CODEX_AUTODL_SSH_OK' | grep -q 'CODEX_AUTODL_SSH_OK'; then
@@ -2480,8 +3084,13 @@ if [[ "$SKIP_CODEX_INSTALL" -eq 0 ]]; then
     remote_current_login_shell_ok=1
   fi
 
-  latest_version="$(resolve_latest_codex_version || true)"
+  desktop_codex_version="$(resolve_desktop_codex_version || true)"
   latest_resolution_failed=0
+  if [[ -n "$desktop_codex_version" ]]; then
+    latest_version="$desktop_codex_version"
+  else
+    latest_version="$(resolve_latest_codex_version || true)"
+  fi
 
   if [[ -z "$latest_version" ]]; then
     latest_resolution_failed=1
@@ -2501,20 +3110,19 @@ if [[ "$SKIP_CODEX_INSTALL" -eq 0 ]]; then
     fi
   fi
 
-  if [[ "$latest_resolution_failed" -eq 0 ]]; then
+  if [[ -n "$desktop_codex_version" ]]; then
+    echo "Desktop Codex version: $latest_version ($codex_target)"
+  elif [[ "$latest_resolution_failed" -eq 0 ]]; then
     echo "Latest Codex release: $latest_version ($codex_target)"
   else
     echo "Selected Codex release: $latest_version ($codex_target)"
   fi
 
   if [[ "$remote_codex_version" == "$latest_version" && "$remote_current_login_shell_ok" -eq 1 ]]; then
-    echo "Remote Codex is already latest and visible to login shell: $remote_codex_version"
-  elif [[ -n "$remote_codex_version" && "$remote_current_login_shell_ok" -eq 1 ]]; then
-    # ponytail: keep working remote CLI; AutoDL often times out on 125MB npm package
-    echo "Remote Codex $remote_codex_version is usable; skipping optional upgrade to $latest_version."
+    echo "Remote Codex matches desktop and is visible to login shell: $remote_codex_version"
   else
     if [[ -n "$remote_codex_version" ]]; then
-      echo "Remote Codex version is $remote_codex_version; latest is $latest_version. Updating..."
+      echo "Remote Codex version is $remote_codex_version; desktop requires $latest_version. Updating..."
     else
       echo "Remote Codex is missing. Installing..."
     fi
@@ -2531,9 +3139,9 @@ download_file() {
   output="$1"
   url="$2"
   attempt=1
-  while [ "$attempt" -le 3 ]; do
+  while [ "$attempt" -le 1 ]; do
     if command -v curl >/dev/null 2>&1; then
-      if curl -fL --connect-timeout 20 --max-time 300 -o "$output" "$url"; then
+      if curl -fL --connect-timeout 20 --max-time 120 -o "$output" "$url"; then
         return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
@@ -2820,6 +3428,7 @@ REMOTE_CODEX_PACKAGE_INSTALL
 
     ssh "$ALIAS" "rm -rf '$remote_tmp_dir'"
     fi
+    REMOTE_CODEX_UPDATED=1
   fi
 else
   echo
@@ -2859,6 +3468,13 @@ fi
 
 if [[ "$SYNC_LOCAL_SKILLS" -eq 1 ]]; then
   sync_local_skills_to_remote "$ALIAS"
+fi
+if [[ "$SYNC_LOCAL_PLUGINS" -eq 1 ]]; then
+  sync_compatible_plugins_to_remote "$ALIAS"
+fi
+if [[ "$REMOTE_CODEX_UPDATED" -eq 1 && "$REMOTE_APP_SERVER_RESTARTED" -eq 0 ]]; then
+  echo "Remote Codex binary changed; restarting app-server once."
+  restart_remote_codex_app_server "$ALIAS"
 fi
 
 echo

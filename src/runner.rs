@@ -1,3 +1,4 @@
+use crate::local_codex::LocalModelDefaults;
 use crate::paths::ProjectPaths;
 use crate::profile::{Profile, ProfileStatus, ProfileStore, now_string};
 use crate::secrets::{self, SecretKind};
@@ -356,7 +357,7 @@ async fn run_job_inner(
     alias: &str,
     action: JobAction,
 ) -> Result<()> {
-    let profile = if matches!(action, JobAction::RepairActive) {
+    let mut profile = if matches!(action, JobAction::RepairActive) {
         None
     } else {
         Some(
@@ -365,6 +366,14 @@ async fn run_job_inner(
                 .with_context(|| format!("profile not found: {alias}"))?,
         )
     };
+
+    if matches!(
+        action,
+        JobAction::Connect | JobAction::QuickReconnect | JobAction::Diagnose
+    ) && let Some(profile) = profile.as_mut()
+    {
+        apply_local_model_defaults(profile, &LocalModelDefaults::detect());
+    }
 
     if profile.is_some() {
         ctx.profiles
@@ -432,7 +441,7 @@ async fn run_job_inner(
         }
         let (profile_status, message) = match action {
             JobAction::Connect => (ProfileStatus::Connected, "连接完成"),
-            JobAction::QuickReconnect => (ProfileStatus::Connected, "隧道已修复"),
+            JobAction::QuickReconnect => (ProfileStatus::Connected, "重连与配置同步完成"),
             JobAction::RepairActive => unreachable!("handled above"),
             JobAction::Diagnose => (ProfileStatus::Connected, "诊断完成"),
             JobAction::StopTunnel => (ProfileStatus::Stopped, "隧道已停止"),
@@ -477,7 +486,7 @@ fn build_args(
     let mut args = vec!["--alias".to_string(), profile.alias.clone()];
 
     match action {
-        JobAction::Connect => {
+        JobAction::Connect | JobAction::QuickReconnect => {
             if let Some(password) = secrets::get_secret(SecretKind::SshPassword, &profile.alias)? {
                 let file = write_temp_secret(job_id, "ssh-password", &password)?;
                 args.push("--ssh-password-file".to_string());
@@ -494,8 +503,14 @@ fn build_args(
 
             append_provider_args(&mut args, profile);
 
+            let live = crate::local_codex::LocalModelDefaults::detect();
+            let provider_for_key = if live.api_provider_name.trim().is_empty() {
+                profile.api_provider_name.as_str()
+            } else {
+                live.api_provider_name.as_str()
+            };
             let stored_api_key = secrets::get_secret(SecretKind::ApiKey, &profile.alias)?;
-            let api_key = if profile.api_provider_name == "claude-code-router" {
+            let api_key = if provider_for_key == "claude-code-router" {
                 if let Some(current_api_key) = secrets::current_ccr_codex_api_key() {
                     if stored_api_key.as_deref() != Some(current_api_key.as_str()) {
                         if let Err(err) = secrets::set_secret(
@@ -530,11 +545,6 @@ fn build_args(
             args.push("--diagnose".to_string());
             args.push(profile.ssh_command.clone());
         }
-        JobAction::QuickReconnect => {
-            args.push("--quick-reconnect".to_string());
-            args.push("--local-api-port".to_string());
-            args.push(port_spec(profile));
-        }
         JobAction::Diagnose => {
             args.push("--local-api-port".to_string());
             args.push(port_spec(profile));
@@ -561,29 +571,66 @@ fn build_args(
     Ok(args)
 }
 
+fn apply_local_model_defaults(profile: &mut Profile, defaults: &LocalModelDefaults) {
+    // 当前本机 Codex 是配置源；远端端口保留 profile 的显式映射。
+    profile.local_api_port = defaults.local_api_port;
+    profile.api_provider_name = defaults.api_provider_name.clone();
+    profile.wire_api = defaults.wire_api.clone();
+    profile.model = defaults.model.clone();
+    profile.model_catalog_path = defaults.model_catalog_path.clone();
+}
+
 fn append_provider_args(args: &mut Vec<String>, profile: &Profile) {
-    args.push("--api-provider-name".to_string());
-    args.push(profile.api_provider_name.clone());
-
-    args.push("--wire-api".to_string());
-    args.push(profile.wire_api.clone());
-
-    if let Some(model) = profile
+    // 每次连接都从本机当前 Codex/CCR 配置取 provider/model/catalog，
+    // 避免 profiles.json 里旧快照把远端模型列表钉死。
+    let live = crate::local_codex::LocalModelDefaults::detect();
+    let provider = if live.api_provider_name.trim().is_empty() {
+        profile.api_provider_name.as_str()
+    } else {
+        live.api_provider_name.as_str()
+    };
+    let wire_api = if live.wire_api.trim().is_empty() {
+        profile.wire_api.as_str()
+    } else {
+        live.wire_api.as_str()
+    };
+    let model = live
         .model
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
-
-    if let Some(catalog) = profile
+        .or_else(|| {
+            profile
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let catalog = live
         .model_catalog_path
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
+        .or_else(|| {
+            profile
+                .model_catalog_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+
+    args.push("--api-provider-name".to_string());
+    args.push(provider.to_string());
+
+    args.push("--wire-api".to_string());
+    args.push(wire_api.to_string());
+
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+
+    if let Some(catalog) = catalog {
         args.push("--model-catalog-file".to_string());
         args.push(catalog.to_string());
     }
@@ -734,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_provider_args_preserve_ccr_settings() {
+    fn diagnose_provider_args_include_provider_flags() {
         let mut profile = test_profile("ccr-box", 18990, 18990);
         profile.api_provider_name = "claude-code-router".to_string();
         profile.model = Some("codex2api/gpt-5.6-sol".to_string());
@@ -742,18 +789,37 @@ mod tests {
 
         let mut args = Vec::new();
         append_provider_args(&mut args, &profile);
+        // Live local Codex defaults may override profile snapshot values.
+        assert!(args.windows(2).any(|w| w[0] == "--api-provider-name"));
+        assert!(args.windows(2).any(|w| w[0] == "--wire-api"));
+        assert!(args.windows(2).any(|w| w[0] == "--model"));
+        assert!(args.windows(2).any(|w| w[0] == "--model-catalog-file"));
+    }
+
+    #[test]
+    fn reconnect_refreshes_current_local_model_settings() {
+        let mut profile = test_profile("ccr-box", 18990, 19000);
+        profile.api_provider_name = "codex2api".to_string();
+        profile.model = Some("old-model".to_string());
+        profile.model_catalog_path = Some("/tmp/old-catalog.json".to_string());
+        let defaults = LocalModelDefaults {
+            local_api_port: 18890,
+            remote_api_port: 18890,
+            api_provider_name: "claude-code-router".to_string(),
+            wire_api: "responses".to_string(),
+            model: Some("codex/gpt-5.6-sol".to_string()),
+            model_catalog_path: Some("/tmp/current-catalog.json".to_string()),
+        };
+
+        apply_local_model_defaults(&mut profile, &defaults);
+
+        assert_eq!(profile.local_api_port, 18890);
+        assert_eq!(profile.remote_api_port, 19000);
+        assert_eq!(profile.api_provider_name, "claude-code-router");
+        assert_eq!(profile.model.as_deref(), Some("codex/gpt-5.6-sol"));
         assert_eq!(
-            args,
-            vec![
-                "--api-provider-name",
-                "claude-code-router",
-                "--wire-api",
-                "responses",
-                "--model",
-                "codex2api/gpt-5.6-sol",
-                "--model-catalog-file",
-                "~/.codex/ccr-model-catalog.json",
-            ]
+            profile.model_catalog_path.as_deref(),
+            Some("/tmp/current-catalog.json")
         );
     }
 

@@ -335,7 +335,10 @@ wire_api = "responses"
 requires_openai_auth = true
 ```
 
-重写 provider 时会先清掉旧的 `model` / `model_provider` / `model_catalog_json` 行再重写：如果你在面板里填了“默认模型”，就写死成那个值；没填就交给当前 Codex App/CLI 选择。若老服务器的模型列表仍停在旧版本，重新点一次“连接”会同时升级远端 Codex；“修复隧道”只负责把隧道接通。
+重写 provider 时会先清掉旧的 `model` / `model_provider` / `model_catalog_json` 行再重写：
+如果你在面板里填了“默认模型”，就写死成那个值；没填就交给当前 Codex App/CLI 选择。
+面板里的“连接”和“重连并同步”都会执行完整对账；只有后台自动巡检和命令行
+`--quick-reconnect` 属于紧急隧道修复，不刷新远端配置。
 
 `requires_openai_auth = true` 表示复用 Codex 的 API key 登录缓存。因为请求已经发到 `codex2api`，这里的 key 应该是你的 `codex2api` key，不是 OpenAI 官方 key。
 
@@ -371,8 +374,11 @@ requires_openai_auth = true
 CCR 监听 `127.0.0.1:18990`，key 是 CCR 自己生成的 `ccr-profile-...`。新版 CCR 把
 Codex profile key 存在 `~/.claude-code-router/app-data/api-keys.sqlite` 的
 `profile:default-codex` 记录中；连接 CCR profile 时，控制面板会自动读取当前值并刷新
-Keychain，重装或轮换后不需要手抄。CCR 的模型名必须带命名空间，例如
-`codex2api/gpt-5.5`、`kiro-rs/claude-fable-5`，裸 `gpt-5.5` 会 `All target providers failed`。
+Keychain，重装或轮换后不需要手抄。CCR 的完整模型名通常带命名空间，例如
+`codex2api/gpt-5.5`、`kiro-rs/claude-fable-5`。控制面板仍保存完整名称；上传到远端
+Codex Desktop 时，去掉 `codex2api/` 或 `codex/` 前缀，让 `gpt-5.6-sol`、`gpt-5.5` 等名称通过
+Desktop 的模型白名单。CCR 会把这些裸名称路由回首选 provider；
+其他 provider（如 `kiro-rs/`、`grok2api/`）仍保留命名空间。
 
 命令行版本：
 
@@ -392,7 +398,14 @@ Keychain，重装或轮换后不需要手抄。CCR 的模型名必须带命名�
 
 `--api-provider-name / --wire-api / --model / --model-catalog-file` 都是可选的：不填就沿用默认的 `codex2api` + `responses`，行为和以前一致。
 
-CCR 默认使用它实时维护的 `~/.codex/ccr-model-catalog.json`。codex2autodl 会在每次点“连接”时把当前文件上传到远端；模型变化后重新点一次“连接”即可刷新菜单，“修复隧道”只接通网络，不刷新模型目录。
+CCR 默认使用它实时维护的 `~/.codex/ccr-model-catalog.json`。codex2autodl 会在每次点
+“连接”或“重连并同步”时重新读取本机 Codex 的当前 catalog 路径，并把当前文件上传到
+远端；模型变化后不用重启控制面板。后台自动巡检仍只修隧道，避免频繁重启远端
+app-server。
+
+连接时还会让远端 Codex CLI 与本机 Codex Desktop 内置版本保持一致。远端 app-server
+版本落后时，即使 `/v1/responses` 对话正常、`codex debug models` 也能读取 catalog，
+桌面端仍可能只显示“自定义”；版本同步后会重启远端 app-server 并重新获取模型列表。
 
 控制面板启动时会读取本机 `~/.codex/config.toml` 的当前 provider、端口、默认模型和
 `model_catalog_json`。旧版档案如果还没有 catalog 配置，会自动迁移到这套本机配置；
@@ -400,6 +413,22 @@ CCR 默认使用它实时维护的 `~/.codex/ccr-model-catalog.json`。codex2aut
 
 后台自动巡检会按每个服务器 profile 自己的本地/远端 API 端口修复隧道：CCR 可以使用
 `18990`，普通 codex2api 可以继续使用 `8080`，两者不会再被统一按 `8080` 重连。
+
+同一个 SSH alias 只保留当前 profile 对应的一条受管反向隧道。控制面板启动或重新连接时，
+会自动卸载该 alias 的旧端口 launchd/watchdog（例如从 `8080`、`18990` 迁移到 `18890`），
+避免多套守护进程同时抢占 SSH 会话，导致 Codex Desktop 的模型能力探针超时、模型菜单不可选。
+
+### Skills 与 plugins 同步边界
+
+- “连接”和“重连并同步”走同一套完整对账：SSH alias、Codex 版本、API key、
+  provider/config、model catalog、用户 skills、兼容 plugins。每项先比较，完全一致就跳过，
+  只有变化的项才上传、安装或重启 app-server。
+- `~/.codex/skills` 和 `~/.agents/skills` 下的用户 skills 会在连接/显式重连时上传。
+- `.system` skills 不复制：它们随 Codex 二进制发布；远端 Codex 与本机版本对齐后会自动具备。
+- 本机已启用的 plugin 会按 `plugin@marketplace` 与远端 catalog 求交集，只安装远端也提供的
+  兼容项。Linux 远端没有的 macOS/桌面插件（例如 Chrome、Computer Use）会明确跳过，不会
+  把 Mac 绝对路径硬塞到远端。
+- 后台自动巡检只负责隧道健康，不同步 skills/plugins；需要刷新时点“重连并同步”。
 
 ## 常见问题
 

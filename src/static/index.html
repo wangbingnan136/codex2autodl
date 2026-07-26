@@ -95,11 +95,11 @@
           <div class="field-grid">
             <label>
               <span>本地 API 端口</span>
-              <input name="local_api_port" type="number" min="1" max="65535" value="18990" />
+              <input name="local_api_port" type="number" min="1" max="65535" value="8080" />
             </label>
             <label>
               <span>远端 API 端口</span>
-              <input name="remote_api_port" type="number" min="1" max="65535" value="18990" />
+              <input name="remote_api_port" type="number" min="1" max="65535" value="8080" />
             </label>
           </div>
           <label>
@@ -120,12 +120,12 @@
             </label>
             <label>
               <span>默认模型</span>
-              <input name="model" autocomplete="off" value="codex2api/gpt-5.5" placeholder="codex2api/gpt-5.5" />
+              <input name="model" autocomplete="off" placeholder="由本机 Codex 配置自动填充" />
             </label>
           </div>
           <label>
             <span>模型 catalog 文件（本机路径，可选）</span>
-            <input name="model_catalog_path" autocomplete="off" value="~/.codex/ccr-model-catalog.json" placeholder="~/.codex/ccr-model-catalog.json" />
+            <input name="model_catalog_path" autocomplete="off" placeholder="由本机 Codex 配置自动填充" />
           </label>
           <label>
             <span>备注</span>

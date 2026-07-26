@@ -72,22 +72,26 @@ fn parse_config(config: &str, home: &Path, codex_home: &Path) -> LocalModelDefau
         }
     }
 
+    let provider = provider.unwrap_or_else(|| "codex2api".to_string());
     let fallback_catalog = codex_home.join("ccr-model-catalog.json");
     let catalog = catalog
         .map(|path| expand_home(&path, home))
         .filter(|path| path.is_file())
-        .or_else(|| fallback_catalog.is_file().then_some(fallback_catalog));
+        .or_else(|| {
+            (provider == "claude-code-router" && fallback_catalog.is_file())
+                .then_some(fallback_catalog)
+        });
     let port = provider_base_url
         .as_deref()
         .and_then(loopback_port)
-        .unwrap_or(18990);
+        .unwrap_or(8080);
 
     LocalModelDefaults {
         local_api_port: port,
         remote_api_port: port,
-        api_provider_name: provider.unwrap_or_else(|| "claude-code-router".to_string()),
+        api_provider_name: provider,
         wire_api: wire_api.unwrap_or_else(|| "responses".to_string()),
-        model: model.or_else(|| Some("codex2api/gpt-5.5".to_string())),
+        model,
         model_catalog_path: catalog.map(|path| path.display().to_string()),
     }
 }
@@ -125,26 +129,34 @@ mod tests {
 
     #[test]
     fn reads_active_local_provider_defaults() {
-        let home = Path::new("/Users/test");
+        let home = std::env::temp_dir().join(format!(
+            "codex2autodl-local-defaults-test-{}",
+            std::process::id()
+        ));
         let codex_home = home.join(".codex");
-        let defaults = parse_config(
+        fs::create_dir_all(&codex_home).unwrap();
+        let catalog = codex_home.join("catalog.json");
+        fs::write(&catalog, r#"{"models":[]}"#).unwrap();
+        let config = format!(
             r#"
 model_provider = "claude-code-router"
 model = "codex2api/gpt-5.6-sol"
-model_catalog_json = "~/.codex/catalog.json"
+model_catalog_json = "{}"
 
 [model_providers.claude-code-router]
 base_url = "http://127.0.0.1:18890/v1"
 wire_api = "responses"
 "#,
-            home,
-            &codex_home,
+            catalog.display()
         );
+        let defaults = parse_config(&config, &home, &codex_home);
 
         assert_eq!(defaults.local_api_port, 18890);
+        assert_eq!(defaults.remote_api_port, 18890);
         assert_eq!(defaults.api_provider_name, "claude-code-router");
         assert_eq!(defaults.model.as_deref(), Some("codex2api/gpt-5.6-sol"));
         assert_eq!(defaults.wire_api, "responses");
+        fs::remove_dir_all(home).ok();
     }
 
     #[test]
@@ -152,5 +164,18 @@ wire_api = "responses"
         assert_eq!(loopback_port("http://localhost:8080/v1"), Some(8080));
         assert_eq!(loopback_port("https://127.0.0.1:18890/v1"), Some(18890));
         assert_eq!(loopback_port("https://example.com:443/v1"), None);
+    }
+
+    #[test]
+    fn missing_config_uses_neutral_codex2api_defaults() {
+        let home = Path::new("/Users/test");
+        let defaults = parse_config("", home, &home.join(".codex"));
+
+        assert_eq!(defaults.local_api_port, 8080);
+        assert_eq!(defaults.remote_api_port, 8080);
+        assert_eq!(defaults.api_provider_name, "codex2api");
+        assert_eq!(defaults.wire_api, "responses");
+        assert_eq!(defaults.model, None);
+        assert_eq!(defaults.model_catalog_path, None);
     }
 }

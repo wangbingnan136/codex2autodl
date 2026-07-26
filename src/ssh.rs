@@ -250,6 +250,85 @@ pub fn cleanup_alias_artifacts(alias: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn cleanup_obsolete_tunnels(alias: &str, keep_remote_port: u16) -> Result<Vec<u16>> {
+    validate_alias(alias)?;
+    let ports = managed_tunnel_ports(alias)?;
+    let mut removed = Vec::new();
+
+    for port in ports {
+        if port == keep_remote_port {
+            continue;
+        }
+        stop_managed_tunnel(alias, port)?;
+        removed.push(port);
+    }
+
+    Ok(removed)
+}
+
+fn managed_tunnel_ports(alias: &str) -> Result<BTreeSet<u16>> {
+    let home = home_dir()?;
+    let mut ports = BTreeSet::new();
+
+    for dir in [home.join(".ssh"), home.join("Library/LaunchAgents")] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if let Some(port) = tunnel_artifact_remote_port(&file_name, alias) {
+                ports.insert(port);
+            }
+        }
+    }
+
+    Ok(ports)
+}
+
+fn stop_managed_tunnel(alias: &str, remote_port: u16) -> Result<()> {
+    let home = home_dir()?;
+    let launch_agent = home.join(format!(
+        "Library/LaunchAgents/codex2autodl-{alias}-proxy-{remote_port}.plist"
+    ));
+    bootout_launch_agent(
+        &launch_agent,
+        &proxy_tunnel_launchd_label(alias, &remote_port.to_string()),
+    );
+
+    let ssh_dir = home.join(".ssh");
+    let pid_path = ssh_dir.join(format!(
+        "codex2autodl-{alias}-proxy-{remote_port}.watchdog.pid"
+    ));
+    if let Ok(pid) = fs::read_to_string(&pid_path) {
+        terminate_pid(pid.trim());
+    }
+
+    let control_path = ssh_dir.join(format!("codex2autodl-{alias}-proxy-{remote_port}.sock"));
+    if control_path.exists() {
+        let mut command = Command::new(SSH_BIN);
+        command
+            .arg("-S")
+            .arg(&control_path)
+            .args(["-O", "exit", alias])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = command_succeeds_with_timeout(command, Duration::from_millis(250));
+    }
+
+    if let Ok(entries) = fs::read_dir(&ssh_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if tunnel_artifact_remote_port(&file_name, alias) == Some(remote_port) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_file(launch_agent);
+    Ok(())
+}
+
 fn cleanup_alias_launch_agents(alias: &str) -> Result<()> {
     let launch_agents = home_dir()?.join("Library/LaunchAgents");
     let Ok(entries) = fs::read_dir(&launch_agents) else {
@@ -279,6 +358,12 @@ fn launch_agent_remote_port<'a>(file_name: &'a str, alias: &str) -> Option<&'a s
     } else {
         None
     }
+}
+
+fn tunnel_artifact_remote_port(file_name: &str, alias: &str) -> Option<u16> {
+    let prefix = format!("codex2autodl-{alias}-proxy-");
+    let suffix = file_name.strip_prefix(&prefix)?;
+    suffix.split('.').next()?.parse().ok()
 }
 
 fn proxy_tunnel_launchd_label(alias: &str, remote_port: &str) -> String {
@@ -993,6 +1078,26 @@ mod tests {
         );
         assert_eq!(
             launch_agent_remote_port("codex2autodl-box-proxy-api.plist", "box"),
+            None
+        );
+    }
+
+    #[test]
+    fn tunnel_artifact_remote_port_matches_all_managed_files() {
+        assert_eq!(
+            tunnel_artifact_remote_port("codex2autodl-suidao-proxy-18890.watchdog.log.1", "suidao"),
+            Some(18890)
+        );
+        assert_eq!(
+            tunnel_artifact_remote_port("codex2autodl-suidao-proxy-8080.sock", "suidao"),
+            Some(8080)
+        );
+        assert_eq!(
+            tunnel_artifact_remote_port("codex2autodl-suidao2-proxy-8080.sock", "suidao"),
+            None
+        );
+        assert_eq!(
+            tunnel_artifact_remote_port("codex2autodl-suidao-proxy-api.sock", "suidao"),
             None
         );
     }

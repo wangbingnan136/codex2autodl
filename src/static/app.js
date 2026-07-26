@@ -9,15 +9,6 @@ const state = {
   sse: null,
 };
 
-const FALLBACK_MODEL_DEFAULTS = {
-  local_api_port: 18990,
-  remote_api_port: 18990,
-  api_provider_name: "claude-code-router",
-  wire_api: "responses",
-  model: "codex2api/gpt-5.5",
-  model_catalog_path: "~/.codex/ccr-model-catalog.json",
-};
-
 const els = {
   navItems: document.querySelectorAll(".nav-item"),
   viewTitle: document.querySelector("#view-title"),
@@ -63,7 +54,7 @@ async function loadProfiles() {
   const body = await api("/api/profiles");
   state.profiles = body.profiles;
   state.dataDir = body.data_dir;
-  state.modelDefaults = body.model_defaults || FALLBACK_MODEL_DEFAULTS;
+  state.modelDefaults = body.model_defaults || null;
   els.count.textContent = String(state.profiles.length);
   renderActiveView();
 }
@@ -169,7 +160,7 @@ function rowTemplate(profile, index) {
       <td>
         <div class="row-actions">
           <button class="secondary-button" type="button" data-action="connect" data-alias="${escapeAttr(profile.alias)}" ${disabled}>${connectLabel}</button>
-          <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>修复</button>
+          <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>重连同步</button>
           <button class="secondary-button" type="button" data-action="diagnose" data-alias="${escapeAttr(profile.alias)}" ${disabled}>诊断</button>
           <button class="icon-button" type="button" data-action="edit" data-alias="${escapeAttr(profile.alias)}" aria-label="编辑">✎</button>
           <button class="icon-button" type="button" data-action="delete" data-alias="${escapeAttr(profile.alias)}" aria-label="删除">×</button>
@@ -223,7 +214,7 @@ function tunnelCardTemplate(profile) {
       <div class="mini-track"><span class="mini-fill" style="width: ${tunnel.width}%"></span></div>
       <div class="ops-actions">
         <button class="primary-button" type="button" data-action="connect" data-alias="${escapeAttr(profile.alias)}" ${disabled}>${connectLabel}</button>
-        <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>修复隧道</button>
+        <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>重连并同步</button>
         <button class="secondary-button" type="button" data-action="diagnose" data-alias="${escapeAttr(profile.alias)}" ${disabled}>诊断</button>
       </div>
     </article>
@@ -274,7 +265,7 @@ function diagnosticCardTemplate(profile) {
       </div>
       <div class="ops-actions">
         <button class="primary-button" type="button" data-action="diagnose" data-alias="${escapeAttr(profile.alias)}" ${disabled}>运行诊断</button>
-        <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>修复隧道</button>
+        <button class="secondary-button" type="button" data-action="repair" data-alias="${escapeAttr(profile.alias)}" ${disabled}>重连并同步</button>
         <button class="secondary-button" type="button" data-action="connect" data-alias="${escapeAttr(profile.alias)}" ${disabled}>连接</button>
       </div>
     </article>
@@ -392,13 +383,18 @@ function markProfileRunning(alias) {
 }
 
 function openPanel(profile = null) {
+  if (!profile && !state.modelDefaults) {
+    showToast("本机 Codex 配置尚未加载，请稍后重试");
+    return;
+  }
+
   state.activeProfile = profile;
   els.title.textContent = profile ? "编辑服务器" : "新增服务器";
   els.form.reset();
 
   els.form.alias.value = profile?.alias || "";
   els.form.ssh_command.value = profile?.ssh_command || "";
-  const d = profile ? {} : state.modelDefaults || FALLBACK_MODEL_DEFAULTS;
+  const d = profile ? {} : state.modelDefaults;
   els.form.local_api_port.value = profile?.local_api_port || d.local_api_port || 8080;
   els.form.remote_api_port.value = profile?.remote_api_port || d.remote_api_port || 8080;
   els.form.api_provider_name.value = profile?.api_provider_name || d.api_provider_name || "";
@@ -557,7 +553,7 @@ function tunnelMeta(stateName) {
 
 function actionLabel(action) {
   if (action === "connect") return "连接";
-  if (action === "quick_reconnect") return "修复隧道";
+  if (action === "quick_reconnect") return "重连并同步";
   if (action === "repair_active") return "修复当前活跃连接";
   if (action === "diagnose") return "诊断";
   if (action === "stop_tunnel") return "停止隧道";

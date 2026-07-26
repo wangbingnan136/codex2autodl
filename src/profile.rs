@@ -15,7 +15,6 @@ use time::format_description::well_known::Rfc3339;
 pub struct ProfileStore {
     path: Arc<std::path::PathBuf>,
     profiles: Arc<Mutex<BTreeMap<String, Profile>>>,
-    model_defaults: Arc<LocalModelDefaults>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,7 +128,6 @@ impl ProfileStore {
         let store = Self {
             path: Arc::new(paths.profiles_file.clone()),
             profiles: Arc::new(Mutex::new(profiles)),
-            model_defaults: Arc::new(model_defaults),
         };
         store.persist()?;
         Ok(store)
@@ -209,7 +207,7 @@ impl ProfileStore {
     }
 
     pub fn model_defaults(&self) -> LocalModelDefaults {
-        self.model_defaults.as_ref().clone()
+        LocalModelDefaults::detect()
     }
 
     /// 是否存在"本应有隧道却掉线"的 profile(供后台健康巡检使用)。
@@ -252,7 +250,7 @@ impl ProfileStore {
 
         let mut profiles = self.profiles.lock().expect("profiles lock poisoned");
         let existing = profiles.get(alias).cloned();
-        let defaults = self.model_defaults.as_ref();
+        let defaults = LocalModelDefaults::detect();
         let now = now_string();
         let profile = Profile {
             alias: alias.to_string(),
@@ -416,7 +414,9 @@ fn migrate_missing_model_settings(
     defaults: &LocalModelDefaults,
 ) {
     for profile in profiles.values_mut() {
-        if profile.model_catalog_path.is_some() {
+        let uses_legacy_fallback =
+            profile.model_catalog_path.as_deref() == Some("~/.codex/ccr-model-catalog.json");
+        if profile.model_catalog_path.is_some() && !uses_legacy_fallback {
             continue;
         }
 
@@ -643,37 +643,50 @@ mod tests {
             model: Some("codex2api/gpt-5.6-sol".to_string()),
             model_catalog_path: Some("/Users/test/.codex/catalog.json".to_string()),
         };
-        let mut profiles = BTreeMap::from([(
-            "legacy".to_string(),
-            Profile {
-                alias: "legacy".to_string(),
-                ssh_command: "ssh legacy".to_string(),
-                user: "root".to_string(),
-                host: "legacy".to_string(),
-                port: 22,
-                local_api_port: 8080,
-                remote_api_port: 8080,
-                api_provider_name: "codex2api".to_string(),
-                wire_api: default_wire_api(),
-                model: None,
-                model_catalog_path: None,
-                note: String::new(),
-                tags: vec![],
-                created_at: now_string(),
-                updated_at: now_string(),
-                last_connected_at: None,
-                last_status: ProfileStatus::New,
-                last_message: String::new(),
-            },
-        )]);
+        let legacy_profile = |alias: &str, catalog| Profile {
+            alias: alias.to_string(),
+            ssh_command: format!("ssh {alias}"),
+            user: "root".to_string(),
+            host: alias.to_string(),
+            port: 22,
+            local_api_port: 18990,
+            remote_api_port: 18990,
+            api_provider_name: "claude-code-router".to_string(),
+            wire_api: default_wire_api(),
+            model: Some("codex2api/gpt-5.5".to_string()),
+            model_catalog_path: catalog,
+            note: String::new(),
+            tags: vec![],
+            created_at: now_string(),
+            updated_at: now_string(),
+            last_connected_at: None,
+            last_status: ProfileStatus::New,
+            last_message: String::new(),
+        };
+        let mut profiles = BTreeMap::from([
+            (
+                "missing".to_string(),
+                Profile {
+                    model: None,
+                    ..legacy_profile("missing", None)
+                },
+            ),
+            (
+                "stale".to_string(),
+                legacy_profile("stale", Some("~/.codex/ccr-model-catalog.json".to_string())),
+            ),
+        ]);
 
         migrate_missing_model_settings(&mut profiles, &defaults);
-        let profile = profiles.get("legacy").unwrap();
-        assert_eq!(profile.local_api_port, 18890);
-        assert_eq!(profile.api_provider_name, "claude-code-router");
-        assert_eq!(
-            profile.model_catalog_path.as_deref(),
-            Some("/Users/test/.codex/catalog.json")
-        );
+        for profile in profiles.values() {
+            assert_eq!(profile.local_api_port, 18890);
+            assert_eq!(profile.remote_api_port, 18890);
+            assert_eq!(profile.api_provider_name, "claude-code-router");
+            assert_eq!(profile.model.as_deref(), Some("codex2api/gpt-5.6-sol"));
+            assert_eq!(
+                profile.model_catalog_path.as_deref(),
+                Some("/Users/test/.codex/catalog.json")
+            );
+        }
     }
 }

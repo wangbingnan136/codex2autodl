@@ -1,6 +1,7 @@
 use crate::paths::ProjectPaths;
 use crate::profile::{ProfileStatus, ProfileStore, SaveProfileRequest};
 use crate::runner::{self, JobAction, JobContext, JobEventKind, JobStatus, JobStore};
+use crate::ssh;
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -39,6 +40,24 @@ struct ProfilesResponse {
 impl AppState {
     pub fn new(paths: ProjectPaths) -> Result<Self> {
         let profiles = ProfileStore::load(&paths)?;
+        for profile in profiles.list() {
+            match ssh::cleanup_obsolete_tunnels(&profile.alias, profile.remote_api_port) {
+                Ok(removed) if !removed.is_empty() => println!(
+                    "removed obsolete tunnel port(s) for {}: {}",
+                    profile.alias,
+                    removed
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Ok(_) => {}
+                Err(err) => eprintln!(
+                    "warning: failed to clean obsolete tunnels for {}: {err}",
+                    profile.alias
+                ),
+            }
+        }
         let job_log_dir = paths.data_dir.join("job-logs");
         let jobs_dir = paths.data_dir.join("jobs");
         Ok(Self {
@@ -265,7 +284,7 @@ fn start_job(state: AppState, alias: String, action: JobAction) -> Response {
 
     let running_message = match action {
         JobAction::Connect => "连接中",
-        JobAction::QuickReconnect => "修复隧道中",
+        JobAction::QuickReconnect => "重连并同步配置中",
         JobAction::RepairActive => "修复活跃连接中",
         JobAction::Diagnose => "诊断中",
         JobAction::StopTunnel => "停止隧道中",
