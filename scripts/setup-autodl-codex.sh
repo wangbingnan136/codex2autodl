@@ -269,7 +269,8 @@ ssh_alias_matches_target() {
     [[ "$(printf '%s\n' "$resolved" | awk '$1 == "serveralivecountmax" { print $2; exit }')" == "$SSH_ALIVE_COUNT_MAX" ]] &&
     [[ "$(printf '%s\n' "$resolved" | awk '$1 == "tcpkeepalive" { print $2; exit }')" == "yes" ]] &&
     [[ "$(printf '%s\n' "$resolved" | awk '$1 == "ipqos" { print $2, $3; exit }')" == "none none" ]] &&
-    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "connecttimeout" { print $2; exit }')" == "$SSH_CONNECT_TIMEOUT" ]]
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "connecttimeout" { print $2; exit }')" == "$SSH_CONNECT_TIMEOUT" ]] &&
+    [[ "$(printf '%s\n' "$resolved" | awk '$1 == "controlmaster" { print $2; exit }')" == "false" ]]
 }
 
 list_codex2autodl_aliases_for_target() {
@@ -416,9 +417,7 @@ ensure_ssh_reliability_override() {
     printf "  TCPKeepAlive yes\n"
     printf "  IPQoS none\n"
     printf "  ConnectTimeout %s\n" "$SSH_CONNECT_TIMEOUT"
-    printf "  ControlMaster auto\n"
-    printf "  ControlPath %s/codex2autodl-%%C.sock\n" "$SSH_DIR"
-    printf "  ControlPersist %s\n" "$SSH_CONTROL_PERSIST"
+    printf "  ControlMaster no\n"
     printf "%s\n\n" "$marker_end"
     cat "$tmp_config"
   } > "$CONFIG_FILE"
@@ -655,7 +654,21 @@ codex login status 2>&1 | sed -E "s/sk-[A-Za-z0-9_-]+/sk-<redacted>/g" || true
 echo
 echo "== codex doctor"
 if command -v codex >/dev/null 2>&1; then
-  codex doctor 2>&1 | sed -n "1,220p"
+  doctor_log="/tmp/codex2autodl-doctor.$$"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30s codex doctor >"$doctor_log" 2>&1
+    doctor_rc=$?
+  else
+    codex doctor >"$doctor_log" 2>&1
+    doctor_rc=$?
+  fi
+  sed -n "1,220p" "$doctor_log"
+  rm -f "$doctor_log"
+  if [ "$doctor_rc" -eq 124 ]; then
+    echo "codex doctor timed out after 30s"
+  elif [ "$doctor_rc" -ne 0 ]; then
+    echo "codex doctor exited with status $doctor_rc"
+  fi
 else
   echo "codex is not installed or not on PATH"
 fi
@@ -1015,7 +1028,8 @@ REMOTE_REMOVE_OLD_MANAGED_SKILLS
 
   (
     cd "$stage"
-    tar -czf - .
+    # GNU tar can hang on macOS provenance xattrs instead of merely warning.
+    COPYFILE_DISABLE=1 tar --no-xattrs -czf - .
   ) | ssh "$alias" 'mkdir -p "$HOME/.codex/skills" && tar -xzf - -C "$HOME/.codex/skills"'
   ssh "$alias" 'umask 077; cat > "$HOME/.codex/codex2autodl-skills.manifest"' < "$manifest"
   ssh "$alias" 'umask 077; cat > "$HOME/.codex/codex2autodl-skills.names"' < "$names"
@@ -2383,7 +2397,6 @@ ACTIVE_ALIAS_PORT_SPECS=()
 SSH_ALIVE_INTERVAL=15
 SSH_ALIVE_COUNT_MAX=8
 SSH_CONNECT_TIMEOUT=15
-SSH_CONTROL_PERSIST=10m
 TUNNEL_CHECK_INTERVAL=15
 TUNNEL_RETRY_INTERVAL=10
 TUNNEL_RETRY_MAX_INTERVAL=120
@@ -2938,8 +2951,10 @@ fi
 
 replace_existing_aliases_for_target "$USER" "$HOST" "$PORT" "$ALIAS"
 
+reset_ssh_control_master "$ALIAS"
+
 if ssh_alias_matches_target "$ALIAS" "$USER" "$HOST" "$PORT" "$KEY_FILE"; then
-  echo "SSH alias config already current; rewrite and control-master reset skipped."
+  echo "SSH alias config already current; rewrite skipped."
 else
   echo "Writing SSH config: $CONFIG_FILE"
   touch "$CONFIG_FILE"
@@ -3000,9 +3015,7 @@ else
     printf "  TCPKeepAlive yes\n"
     printf "  IPQoS none\n"
     printf "  ConnectTimeout %s\n" "$SSH_CONNECT_TIMEOUT"
-    printf "  ControlMaster auto\n"
-    printf "  ControlPath %s/codex2autodl-%%C.sock\n" "$SSH_DIR"
-    printf "  ControlPersist %s\n" "$SSH_CONTROL_PERSIST"
+    printf "  ControlMaster no\n"
     printf "\n"
     cat "$TMP_CONFIG"
   } > "$CONFIG_FILE"
@@ -3010,7 +3023,6 @@ else
   rm -f "$TMP_CONFIG"
   chmod 600 "$CONFIG_FILE"
 
-  reset_ssh_control_master "$ALIAS"
 fi
 
 echo "Verifying passwordless SSH..."
